@@ -93,3 +93,133 @@ def test_unexpected_handler_errors_complete_matrix(reports):
         assert cell["state_diff"]
     for cell in report["cells"][25:]:
         assert "Expected mid-handler crash was not injected" in cell["failure_reason"]
+
+
+def test_muse_aliases_and_defaults(monkeypatch):
+    from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
+
+    for name in ("MUSE_API_KEY", "MUSE_BASE_URL", "MUSE_TIMEOUT_S",
+                 "MUSE_WONDER_MODEL", "MUSE_SPARK_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MODEL_API_KEY", "unit-secret")
+    monkeypatch.setenv("META_BASE_URL", "https://example.invalid/v1/")
+    client = MuseNeuroSymbolicClient()
+    assert client.api_key == "unit-secret"
+    assert client.base_url == "https://example.invalid/v1"
+    assert client.timeout == 20
+    monkeypatch.setenv("MUSE_API_KEY", "primary-secret")
+    monkeypatch.setenv("MUSE_BASE_URL", "https://primary.invalid/v1")
+    monkeypatch.setenv("MUSE_TIMEOUT_S", "25")
+    primary = MuseNeuroSymbolicClient()
+    assert primary.api_key == "primary-secret"
+    assert primary.base_url == "https://primary.invalid/v1"
+    assert primary.timeout == 25
+
+
+def test_muse_fenced_live_patch_and_partial_fallback(monkeypatch):
+    from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
+
+    monkeypatch.setenv("MUSE_API_KEY", "unit-secret")
+    monkeypatch.setenv("DEMO_FALLBACK_CACHE", "false")
+    monkeypatch.setenv("MUSE_WONDER_MODEL", "wonder-live")
+    monkeypatch.setenv("MUSE_SPARK_MODEL", "spark-live")
+    client = MuseNeuroSymbolicClient()
+    calls = []
+    code = "def process_stripe_webhook(session, raw_body, sig_header):\n    return {}\n"
+
+    def request(method, path, **kwargs):
+        payload = kwargs["json"]
+        calls.append(payload["model"])
+        assert payload["response_format"] == {"type": "json_object"}
+        value = ({"invariants": client._invariants({}), "patched_code": code}
+                 if payload["model"] == "wonder-live" else {"failure_clusters": []})
+        return {"choices": [{"message": {"content": "```json\n" + json.dumps(value) + "\n```"}}]}
+
+    monkeypatch.setattr(client, "api_request", request)
+    result = client.run_full_neuro_symbolic_analysis({})
+    assert calls == ["wonder-live", "spark-live"]
+    assert result["patched_code"] == code
+    routing = result["model_routing"]
+    assert routing["wonder_live"] is True
+    assert routing["spark_live"] is False
+    assert routing["used_fallback_cache"] is True
+    assert "spark:" in routing["fallback_reason"]
+    assert "structured output contract" in routing["fallback_reason"]
+    assert len(result["diagnosis"]["failure_clusters"]) == 3
+
+
+def test_muse_cache_forced_without_network(monkeypatch):
+    from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
+
+    monkeypatch.setenv("DEMO_FALLBACK_CACHE", "true")
+    client = MuseNeuroSymbolicClient()
+
+    def unexpected_request(*args, **kwargs):
+        pytest.fail("forced cache must not call the API")
+
+    monkeypatch.setattr(client, "api_request", unexpected_request)
+    result = client.run_full_neuro_symbolic_analysis({})
+    routing = result["model_routing"]
+    assert routing["wonder_live"] is False
+    assert routing["spark_live"] is False
+    assert routing["used_fallback_cache"] is True
+    assert "wonder:" in routing["fallback_reason"]
+    assert "spark:" in routing["fallback_reason"]
+
+
+def test_muse_http_error_redacts_credentials(monkeypatch):
+    import httpx
+    from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
+
+    monkeypatch.setenv("MUSE_API_KEY", "unit-secret")
+    client = MuseNeuroSymbolicClient()
+    original_client = httpx.Client
+
+    def upstream(request):
+        assert request.headers["Authorization"] == "Bearer unit-secret"
+        return httpx.Response(401, text="Rejected unit-secret")
+
+    transport = httpx.MockTransport(upstream)
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: original_client(
+        transport=transport, **kwargs))
+    with pytest.raises(ValueError) as caught:
+        client.api_request("GET", "models")
+    assert "HTTP 401" in str(caught.value)
+    assert "[REDACTED]" in str(caught.value)
+    assert "unit-secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("broken_import", [False, True])
+def test_live_patch_check_is_temporary_and_read_only(monkeypatch, capsys, broken_import):
+    from chaoshook_engine import cli
+
+    active = cli.HANDLER_DIR / "active_handler.py"
+    original = active.read_bytes()
+    source = ("raise ImportError('intentional import failure')\n" if broken_import else
+              (cli.HANDLER_DIR / "v2_patched.py").read_text(encoding="utf-8"))
+
+    class FakeMuse:
+        wonder_model = "unit-wonder"
+        model_routing = {"wonder_live": True}
+
+        def safe_error(self, value):
+            return str(value)
+
+        def extract_invariants_and_patch(self, *args):
+            return {"patched_code": source}
+
+    paths = []
+    original_spec = cli.importlib.util.spec_from_file_location
+
+    def capture_spec(name, path):
+        paths.append(path)
+        assert not path.is_relative_to(active.parents[2])
+        return original_spec(name, path)
+
+    monkeypatch.setattr(cli, "MuseNeuroSymbolicClient", FakeMuse)
+    monkeypatch.setattr(cli.importlib.util, "spec_from_file_location", capture_spec)
+    assert cli.main(["live-patch-check"]) == (1 if broken_import else 0)
+    assert active.read_bytes() == original
+    assert paths and not paths[0].exists()
+    output = capsys.readouterr().out
+    assert ("intentional import failure" if broken_import else "27/27 cells passed") in output
