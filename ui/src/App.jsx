@@ -25,6 +25,9 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(null);
   const [analysis, setAnalysis] = useState(null);
   const [patchOpen, setPatchOpen] = useState(false);
+  const [patchRejection, setPatchRejection] = useState(null);
+  const [instantMode, setInstantMode] = useState(false);
+  const [diagnosisSeconds, setDiagnosisSeconds] = useState(0);
   const [pending, setPending] = useState('load');
   const [error, setError] = useState(null);
   const [inspectorTab, setInspectorTab] = useState('state');
@@ -68,6 +71,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (pending !== 'diagnose') return;
+    const started = Date.now();
+    setDiagnosisSeconds(0);
+    const timer = window.setInterval(() => {
+      setDiagnosisSeconds(Math.floor((Date.now() - started) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [pending]);
+
+  useEffect(() => {
     if (invariant && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
       scoreRef.current?.animate?.(
         [{ transform: 'scale(0.98)', opacity: 0.5 }, { transform: 'scale(1)', opacity: 1 }],
@@ -86,13 +99,23 @@ export default function App() {
 
   function runDiagnosis() {
     setInspectorTab('muse');
-    return request('diagnose', async () => { setAnalysis(await diagnose()); });
+    setPatchRejection(null);
+    return request('diagnose', async () => { setAnalysis(await diagnose({ use_cache: instantMode })); });
   }
 
-  function applyPatch() {
-    if (!analysis) return;
+  function applyPatch(patchedCode) {
+    if (patchedCode === undefined) return;
+    return applyPatchRequest({ patched_code: patchedCode });
+  }
+
+  function applyPatchRequest(body) {
     return request('patch', async () => {
-      const result = await patch({ patched_code: analysis.patched_code });
+      setPatchRejection(null);
+      const result = await patch(body);
+      if (result.verified === false) {
+        setPatchRejection(result);
+        return;
+      }
       displayReport(result.prover_report);
       setStatus(await getStatus());
       setPatchOpen(false);
@@ -139,14 +162,20 @@ export default function App() {
         </div>
         <nav aria-label="Prover actions" className="mt-6 flex flex-wrap gap-3">
           {actions.map(({ id, label, progress, icon: Icon, click, needsReport }) => (
-            <button key={id} type="button" onClick={click} disabled={busy || (needsReport && !report)}
+            <div key={id} className="flex flex-wrap items-center gap-3">
+            <button type="button" onClick={click} disabled={busy || (needsReport && !report)}
               className={`flex items-center gap-2 rounded border px-4 py-3 text-left text-xs font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brass disabled:cursor-wait disabled:opacity-50 ${id === 'diagnose' ? 'border-brass bg-brass text-slate-950 hover:bg-amber-500' : 'border-slate-700 bg-slate-900 text-slate-200 hover:border-brass/70'}`}>
               {pending === id ? <LoaderCircle size={16} aria-hidden="true" className="shrink-0 animate-spin" /> : <Icon size={16} aria-hidden="true" className="shrink-0" />}
               {pending === id ? progress : label}
             </button>
+            {id === 'diagnose' && <label className="flex items-center gap-2 text-xs text-slate-300">
+              <input type="checkbox" checked={instantMode} onChange={(event) => setInstantMode(event.target.checked)} disabled={busy} className="accent-amber-500" />
+              Instant mode (cached)
+            </label>}
+            </div>
           ))}
         </nav>
-        {busy && <p role="status" className="mt-3 flex items-center gap-2 text-xs text-brass"><LoaderCircle size={14} aria-hidden="true" className="animate-spin" />{pending === 'load' ? 'Reading active handler and running all 27 proof cells…' : 'Instrument running · awaiting backend result…'}</p>}
+        {busy && <p role="status" className="mt-3 flex items-center gap-2 text-xs text-brass"><LoaderCircle size={14} aria-hidden="true" className="animate-spin" />{pending === 'diagnose' ? `${instantMode ? 'Loading verified cached analysis' : 'Muse Wonder + Spark 1.3 running live (about 40s)'} · ${diagnosisSeconds}s elapsed` : pending === 'load' ? 'Reading active handler and running all 27 proof cells…' : 'Instrument running · awaiting backend result…'}</p>}
       </header>
 
       {error && <div role="alert" className="mx-auto mb-6 max-w-[2400px] whitespace-pre-wrap break-words rounded-lg border border-crimson/50 bg-crimson/10 p-4 text-sm text-crimson">{error}</div>}
@@ -187,7 +216,7 @@ export default function App() {
           )}
         </aside>
       </div>
-      <CodeDiffPatchModal open={patchOpen} onClose={() => setPatchOpen(false)} analysis={analysis} onApply={applyPatch} applying={pending === 'patch'} />
+      <CodeDiffPatchModal open={patchOpen} onClose={() => setPatchOpen(false)} analysis={analysis} onApply={applyPatch} onApplyCached={() => applyPatchRequest()} rejection={patchRejection} applying={pending === 'patch'} />
     </main>
   );
 }

@@ -106,7 +106,7 @@ def test_muse_aliases_and_defaults(monkeypatch):
     client = MuseNeuroSymbolicClient()
     assert client.api_key == "unit-secret"
     assert client.base_url == "https://example.invalid/v1"
-    assert client.timeout == 20
+    assert client.timeout == 90
     monkeypatch.setenv("MUSE_API_KEY", "primary-secret")
     monkeypatch.setenv("MUSE_BASE_URL", "https://primary.invalid/v1")
     monkeypatch.setenv("MUSE_TIMEOUT_S", "25")
@@ -117,6 +117,7 @@ def test_muse_aliases_and_defaults(monkeypatch):
 
 
 def test_muse_fenced_live_patch_and_partial_fallback(monkeypatch):
+    from threading import Barrier
     from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
 
     monkeypatch.setenv("MUSE_API_KEY", "unit-secret")
@@ -125,11 +126,13 @@ def test_muse_fenced_live_patch_and_partial_fallback(monkeypatch):
     monkeypatch.setenv("MUSE_SPARK_MODEL", "spark-live")
     client = MuseNeuroSymbolicClient()
     calls = []
+    simultaneous_calls = Barrier(2)
     code = "def process_stripe_webhook(session, raw_body, sig_header):\n    return {}\n"
 
     def request(method, path, **kwargs):
         payload = kwargs["json"]
         calls.append(payload["model"])
+        simultaneous_calls.wait(timeout=2)
         assert payload["response_format"] == {"type": "json_object"}
         value = ({"invariants": client._invariants({}), "patched_code": code}
                  if payload["model"] == "wonder-live" else {"failure_clusters": []})
@@ -137,12 +140,13 @@ def test_muse_fenced_live_patch_and_partial_fallback(monkeypatch):
 
     monkeypatch.setattr(client, "api_request", request)
     result = client.run_full_neuro_symbolic_analysis({})
-    assert calls == ["wonder-live", "spark-live"]
+    assert sorted(calls) == ["spark-live", "wonder-live"]
     assert result["patched_code"] == code
     routing = result["model_routing"]
     assert routing["wonder_live"] is True
     assert routing["spark_live"] is False
     assert routing["used_fallback_cache"] is True
+    assert routing["elapsed_ms"] >= 0
     assert "spark:" in routing["fallback_reason"]
     assert "structured output contract" in routing["fallback_reason"]
     assert len(result["diagnosis"]["failure_clusters"]) == 3
@@ -223,3 +227,68 @@ def test_live_patch_check_is_temporary_and_read_only(monkeypatch, capsys, broken
     assert paths and not paths[0].exists()
     output = capsys.readouterr().out
     assert ("intentional import failure" if broken_import else "27/27 cells passed") in output
+
+
+def test_patch_api_verifies_before_install_and_cached_fallback(monkeypatch):
+    from fastapi.testclient import TestClient
+    from chaoshook_engine import server
+    from chaoshook_engine.patcher import HANDLER_DIR, apply_patch_to_active
+
+    active = HANDLER_DIR / "active_handler.py"
+    original = active.read_text(encoding="utf-8")
+    client = TestClient(server.app)
+    try:
+        for source, passed, import_failed in (
+            ("def broken(", 0, True),
+            ("raise ImportError('bad candidate')", 0, True),
+            ((HANDLER_DIR / "v1_vulnerable.py").read_text(encoding="utf-8"), 6, False),
+        ):
+            before = active.read_bytes()
+            result = client.post("/api/patch", json={"patched_code": source})
+            assert result.status_code == 200
+            body = result.json()
+            assert body["verified"] is False
+            assert body["passed_cells"] == passed
+            assert bool(body["import_error"]) is import_failed
+            if not import_failed:
+                assert len(body["failed_cell_ids"]) == 21
+                assert body["prover_report"]["passed_cells"] == 6
+            assert active.read_bytes() == before
+
+        patched_code = (HANDLER_DIR / "v2_patched.py").read_text(encoding="utf-8")
+        candidate = patched_code + "\n# Candidate proved before installation.\n"
+        accepted = client.post("/api/patch", json={"patched_code": candidate}).json()
+        assert accepted["verified"] is True
+        assert accepted["prover_report"]["passed_cells"] == 27
+        assert active.read_text(encoding="utf-8") == candidate
+
+        # No body must select reference v2 even when the latest proposal is invalid.
+        server.app.state.analysis = {"patched_code": "def broken("}
+        cached = client.post("/api/patch").json()
+        assert cached["verified"] is True
+        assert cached["prover_report"]["passed_cells"] == 27
+        assert active.read_text(encoding="utf-8") == patched_code
+    finally:
+        apply_patch_to_active(original)
+        server.app.state.prover_source = None
+        server.app.state.analysis = None
+
+
+def test_diagnose_instant_mode_never_calls_live_models(monkeypatch):
+    from fastapi.testclient import TestClient
+    from chaoshook_engine import server
+
+    def unexpected_request(*args, **kwargs):
+        pytest.fail("instant mode must not call live models")
+
+    monkeypatch.setattr(server.MuseNeuroSymbolicClient, "api_request", unexpected_request)
+    response = TestClient(server.app).post("/api/diagnose", json={"use_cache": True})
+    assert response.status_code == 200
+    analysis = response.json()
+    routing = analysis["model_routing"]
+    assert routing["wonder_live"] is False and routing["spark_live"] is False
+    assert routing["used_fallback_cache"] is True
+    assert routing["fallback_reason"]
+    assert routing["elapsed_ms"] >= 0
+    assert len(analysis["invariants"]) == 4
+    assert len(analysis["diagnosis"]["failure_clusters"]) == 3

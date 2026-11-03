@@ -1,8 +1,8 @@
 """Local JSON API for the deterministic prover and Muse analysis."""
 
-import ast
 import importlib
 from threading import RLock
+from time import perf_counter
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from chaoshook_engine.muse_client import MuseNeuroSymbolicClient, SPARK, WONDER
 from chaoshook_engine.patcher import (
     apply_patch_to_active, get_active_handler_status, reset_active_to_vulnerable,
+    verify_candidate_patch,
 )
 from chaoshook_engine.runner import run_algebraic_prover
 from target_app.handlers import active_handler
@@ -30,11 +31,13 @@ app.state.analysis = None
 app.state.model_routing = {
     "muse_wonder_model": WONDER, "muse_spark_model": SPARK,
     "used_fallback_cache": False,
+    "wonder_live": False, "spark_live": False, "fallback_reason": None, "elapsed_ms": 0,
 }
 
 
 class DiagnoseRequest(BaseModel):
     diagram_description: str | None = None
+    use_cache: bool = False
 
 
 class PatchRequest(BaseModel):
@@ -85,10 +88,15 @@ def prove() -> dict:
 @app.post("/api/diagnose")
 def diagnose(body: DiagnoseRequest | None = None) -> dict:
     with _lock:
+        started = perf_counter()
         report = _prove(get_active_handler_status())
-        analysis = MuseNeuroSymbolicClient().run_full_neuro_symbolic_analysis(
+        client = MuseNeuroSymbolicClient()
+        if body and body.use_cache:
+            client.force_cache = True
+        analysis = client.run_full_neuro_symbolic_analysis(
             report, diagram_description=body.diagram_description if body else None,
         )
+        analysis["model_routing"]["elapsed_ms"] = round((perf_counter() - started) * 1000, 3)
         app.state.analysis = analysis
         app.state.model_routing = dict(analysis["model_routing"])
         return {**analysis, "proposed_patch_code": analysis["patched_code"]}
@@ -98,25 +106,19 @@ def diagnose(body: DiagnoseRequest | None = None) -> dict:
 def patch(body: PatchRequest | None = None) -> dict:
     with _lock:
         code = body.patched_code if body else None
-        # A cached proposal is valid only for the source that was analyzed.
-        current = get_active_handler_status()
-        if (code is None and app.state.analysis is not None
-                and current["active_code"] == app.state.prover_source):
-            code = app.state.analysis["patched_code"]
         if code is not None:
-            try:
-                tree = ast.parse(code)
-                if not any(isinstance(node, ast.FunctionDef)
-                           and node.name == "process_stripe_webhook" for node in tree.body):
-                    raise ValueError("Patch must define process_stripe_webhook")
-            except (SyntaxError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=f"Invalid handler patch: {exc}") from exc
+            verification = verify_candidate_patch(code)
+            if not verification["verified"]:
+                if verification["import_error"]:
+                    verification["import_error"] = MuseNeuroSymbolicClient().safe_error(
+                        verification["import_error"])
+                return {"status": "rejected", **verification}
         try:
             handler_status = apply_patch_to_active(code)
         except Exception as exc:
             # The patcher restores the previous source when installation fails.
             raise HTTPException(status_code=400, detail="Handler patch could not be loaded") from exc
-        return _proof_response(handler_status)
+        return {**_proof_response(handler_status), "verified": True}
 
 
 @app.post("/api/reset")

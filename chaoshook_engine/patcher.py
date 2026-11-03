@@ -4,13 +4,47 @@ import difflib
 import importlib
 from pathlib import Path
 import sys
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import RLock
+from uuid import uuid4
 
 
 HANDLER_DIR = Path(__file__).resolve().parents[1] / "target_app" / "handlers"
 _LOCK = RLock()
 _MODULE = "target_app.handlers.active_handler"
+
+
+def verify_candidate_patch(code: str) -> dict:
+    """Import and prove a candidate outside the repo without installing it."""
+    from chaoshook_engine.runner import run_algebraic_prover
+
+    result = {"verified": False, "passed_cells": 0, "total_cells": 27,
+              "failed_cell_ids": [], "prover_report": None, "import_error": None}
+    with TemporaryDirectory(prefix="chaoshook-candidate-", dir="/tmp") as directory:
+        path = Path(directory) / "candidate.py"
+        path.write_text(code, encoding="utf-8")
+        name = f"_chaoshook_candidate_{uuid4().hex}"
+        try:
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+                handler = module.process_stripe_webhook
+                if not callable(handler):
+                    raise TypeError("process_stripe_webhook must be callable")
+            except Exception as exc:
+                result["import_error"] = f"{type(exc).__name__}: {exc}"
+                return result
+            report = run_algebraic_prover(handler)
+            result.update(
+                verified=report["passed_cells"] == report["total_cells"] == 27,
+                passed_cells=report["passed_cells"], prover_report=report,
+                failed_cell_ids=[cell["id"] for cell in report["cells"] if not cell["passed"]],
+            )
+            return result
+        finally:
+            sys.modules.pop(name, None)
 
 
 def compute_unified_diff(v1_code: str, v2_code: str) -> str:

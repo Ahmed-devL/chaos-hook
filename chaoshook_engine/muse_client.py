@@ -1,12 +1,15 @@
 """Muse model routing with a deterministic, locally verified demo cache."""
 
 from itertools import permutations
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import math
 import os
 from pathlib import Path
 import re
+from threading import Lock
+from time import perf_counter
 
 import httpx
 
@@ -47,7 +50,7 @@ def _load_env():
 
 
 _load_env()
-WONDER = os.getenv("MUSE_WONDER_MODEL", "muse-wonder").strip() or "muse-wonder"
+WONDER = os.getenv("MUSE_WONDER_MODEL", "muse-wonder-1.0").strip() or "muse-wonder-1.0"
 SPARK = os.getenv("MUSE_SPARK_MODEL", "muse-spark-1.3").strip() or "muse-spark-1.3"
 WONDER_PROMPT = """You are Meta Muse Wonder, a Principal Distributed Systems & Formal
 Verification Architect inside ChaosHook (The Brass Escapement).
@@ -79,11 +82,11 @@ class MuseNeuroSymbolicClient:
         self.wonder_model = os.getenv("MUSE_WONDER_MODEL", WONDER).strip() or WONDER
         self.spark_model = os.getenv("MUSE_SPARK_MODEL", SPARK).strip() or SPARK
         try:
-            self.timeout = float(os.getenv("MUSE_TIMEOUT_S", "20"))
+            self.timeout = float(os.getenv("MUSE_TIMEOUT_S", "90"))
             if not math.isfinite(self.timeout) or self.timeout <= 0:
                 raise ValueError("invalid timeout")
         except ValueError:
-            self.timeout = 20.0
+            self.timeout = 90.0
         self.force_cache = os.getenv("DEMO_FALLBACK_CACHE", "false").strip().lower() in {
             "true", "1", "yes", "on",
         }
@@ -91,6 +94,19 @@ class MuseNeuroSymbolicClient:
         self.model_routing = {"wonder_live": False, "spark_live": False,
                               "fallback_reason": None}
         self._fallback_reasons = {}
+        self._routing_lock = Lock()
+
+    def _record_route(self, part, live, reason=None):
+        with self._routing_lock:
+            self.model_routing[f"{part}_live"] = live
+            if live:
+                self._fallback_reasons.pop(part, None)
+            else:
+                self._fallback_reasons[part] = self.safe_error(reason)
+            self.used_fallback_cache = bool(self._fallback_reasons)
+            self.model_routing["fallback_reason"] = "; ".join(
+                f"{name}: {reason}" for name, reason in sorted(self._fallback_reasons.items())
+            ) or None
 
     def safe_error(self, value):
         """Redact credentials even when an upstream error echoes its input."""
@@ -136,23 +152,16 @@ class MuseNeuroSymbolicClient:
             result = json.loads(content)
             if not validate(result):
                 raise ValueError("model response violates the structured output contract")
-            self.model_routing[f"{part}_live"] = True
-            self._fallback_reasons.pop(part, None)
+            self._record_route(part, True)
             return result
         except Exception as exc:
-            self.model_routing[f"{part}_live"] = False
             reason = (str(exc) if isinstance(exc, ValueError)
                       and not isinstance(exc, json.JSONDecodeError) else type(exc).__name__)
-            self._fallback_reasons[part] = self.safe_error(reason)
+            self._record_route(part, False, reason)
             # Never log credentials, request bodies, or remote error content.
             logger.warning("Using verified deterministic neuro-symbolic cache (%s; %s)",
                            self.safe_error(model), type(exc).__name__)
             return fallback
-        finally:
-            self.used_fallback_cache = bool(self._fallback_reasons)
-            self.model_routing["fallback_reason"] = "; ".join(
-                f"{name}: {reason}" for name, reason in self._fallback_reasons.items()
-            ) or None
 
     @staticmethod
     def _invariants(report):
@@ -238,14 +247,25 @@ class MuseNeuroSymbolicClient:
 
     def run_full_neuro_symbolic_analysis(self, prover_report: dict,
                                         diagram_description: str | None = None) -> dict:
+        started = perf_counter()
         self.used_fallback_cache = False
         self._fallback_reasons.clear()
         self.model_routing.update(wonder_live=False, spark_live=False, fallback_reason=None)
-        wonder = self.extract_invariants_and_patch(
-            (HANDLER_DIR.parent / "models.py").read_text(encoding="utf-8"),
-            (HANDLER_DIR / "active_handler.py").read_text(encoding="utf-8"), prover_report,
-        )
-        diagnosis = self.diagnose_multimodal_divergence(prover_report, diagram_description)
+        schema = (HANDLER_DIR.parent / "models.py").read_text(encoding="utf-8")
+        handler = (HANDLER_DIR / "active_handler.py").read_text(encoding="utf-8")
+        if self.force_cache:
+            wonder = self.extract_invariants_and_patch(schema, handler, prover_report)
+            diagnosis = self.diagnose_multimodal_divergence(prover_report, diagram_description)
+        else:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="Muse") as pool:
+                wonder_future = pool.submit(
+                    self.extract_invariants_and_patch, schema, handler, prover_report,
+                )
+                spark_future = pool.submit(
+                    self.diagnose_multimodal_divergence, prover_report, diagram_description,
+                )
+                wonder, diagnosis = wonder_future.result(), spark_future.result()
+        self.model_routing["elapsed_ms"] = round((perf_counter() - started) * 1000, 3)
         return {
             "model_routing": {**self.model_routing,
                               "muse_wonder_model": self.wonder_model,

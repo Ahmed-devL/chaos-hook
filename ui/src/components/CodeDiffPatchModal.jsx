@@ -9,7 +9,7 @@ function lineStyle(line) {
   return 'text-slate-300';
 }
 
-export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, applying }) {
+export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, onApplyCached, rejection, applying }) {
   const dialogRef = useRef(null);
 
   useEffect(() => {
@@ -32,17 +32,27 @@ export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, a
           <h2 id="patch-title" className="text-xl font-semibold text-brass">Atomic Patch · Unified Diff</h2>
           <button type="button" onClick={onClose} className="rounded border border-slate-600 px-4 py-2 hover:bg-slate-800">Close</button>
         </header>
+        <p className="mb-3 text-sm text-brass">Patch source: {analysis?.model_routing?.wonder_live ? 'LIVE Muse Wonder' : 'Verified cache'}</p>
         <div aria-label="Unified diff" tabIndex={0} className="min-h-0 flex-1 overflow-auto rounded border border-slate-800 bg-slate-950 py-3 font-mono text-xs leading-relaxed sm:text-sm">
           {(analysis?.unified_diff ?? '').split('\n').map((line, index) => (
             <div key={index} className={`min-w-max whitespace-pre px-4 ${lineStyle(line)}`}>{line || ' '}</div>
           ))}
         </div>
         <footer className="mt-4">
-          <button type="button" onClick={onApply} disabled={applying || !analysis?.patched_code}
+          {rejection && <div role="alert" className="mb-3 rounded border border-crimson/50 bg-crimson/10 p-3 text-sm text-crimson">
+            <p>Patch rejected by prover: {rejection.passed_cells}/27 cells pass</p>
+            <p>Failing cells: {rejection.failed_cell_ids?.join(', ') || 'not run (import failed)'}</p>
+            {rejection.import_error && <p className="mt-1 whitespace-pre-wrap break-words">{rejection.import_error}</p>}
+          </div>}
+          <button type="button" onClick={() => onApply(analysis.patched_code)} disabled={applying || !analysis?.patched_code}
             className="flex items-center justify-center gap-2 rounded bg-brass px-5 py-3 font-semibold text-slate-950 hover:bg-amber-500 disabled:cursor-wait disabled:opacity-60">
             {applying && <LoaderCircle aria-hidden="true" size={18} className="animate-spin" />}
-            {applying ? 'Applying Atomic Patch & Re-Proving…' : 'Apply Atomic Patch & Re-Prove (27/27)'}
+            {applying ? 'Verifying Patch Before Applying…' : 'Apply Atomic Patch & Re-Prove (27/27)'}
           </button>
+          {rejection && <button type="button" onClick={onApplyCached} disabled={applying}
+            className="mt-3 rounded border border-brass px-4 py-2 text-sm text-brass hover:bg-brass/10 disabled:opacity-60">
+            Apply verified cached patch instead
+          </button>}
           {applying && <p role="status" className="mt-2 text-sm text-brass">Running all 27 proof cells…</p>}
         </footer>
       </div>
