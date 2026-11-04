@@ -1,12 +1,12 @@
 # The Brass Escapement (ChaosHook)
 
-Deterministic webhook failure proofs with Meta model repair and executable verification.
+Bounded, executable webhook scenario verification with Meta model repair.
 
 Built for the **Meta Global AI Developer Hackathon · Indie Developer Track**.
 
 AI-written webhook handlers can pass happy-path tests yet corrupt state under event reordering, concurrent duplicate bursts, and mid-handler crashes.
 ChaosHook demonstrates these failures deterministically using 27 real-SQL schedules and compares each result against a golden state.
-Meta Muse Wonder synthesizes repairs inside a verified loop, while Meta Muse Spark 1.3 explains the divergence using counterexamples and an architecture diagram image.
+During live analysis, Meta Muse Wonder synthesizes repair candidates, while Meta Muse Spark 1.3 explains the divergence using counterexamples and an architecture diagram image. Cached mode supplies a predefined repair and diagnosis. Independent scenario verification evaluates candidate behavior without model calls.
 
 ## The problem
 
@@ -47,10 +47,14 @@ Wonder synthesis and Spark diagnosis run concurrently during live analysis.
 
 Each proof cell uses an isolated SQLite database cloned from the initial state with `sqlite3.Connection.backup()`.
 SQLAlchemy synchronous statement hooks coordinate a real two-thread barrier and inject crash exceptions at side-effect boundaries.
-The golden state S* is computed independently with the reference handler: 100 credits, one ledger entry, one welcome-email outbox record, and a canceled subscription and user plan.
+The golden state S* is constructed by the frozen `LifecycleScenarioSpec` in `chaoshook_engine/scenario_spec.py`, independently of any handler implementation. Its declared outcomes are a canceled user plan and subscription, subscription period end `1702592000`, initial credit balance `0` plus exactly `100` invoice credits, exactly one ledger row totaling `100`, and exactly one `welcome_pro` outbox record for the seeded user.
+The executable contract checks these outcomes, the ledger's invoice and user attribution, outbox attribution and template, and unexpected execution errors or missing barrier/crash evidence. Expected injected crashes are handled by the runner. Structured violations appear in each cell's `property_violations`; existing state diffs and `golden_state` remain available.
+The verification gate neither imports nor executes `v2_patched.py` to calculate expected state. That file remains an example repair used for the cached demo and as an explicit candidate in regression tests and CLI verification.
 The UI exposes terminal-state differences, SQL traces, and schedule diagrams for individual cells.
 
-## Three algebraic laws, 27 cells
+## Scenario requirements, 27 configured checks
+
+ChaosHook performs bounded, executable scenario verification, not exhaustive mathematical formal verification. Order independence is a declared requirement of this particular four-event lifecycle, not a universal property of webhooks. The equations below express the intended properties; the fixed schedules exercise selected instances of concurrency and crash recovery.
 
 Let H(S, e) apply event e to state S, E be the four canonical events, and fold apply a sequence of events.
 Equality here means equality of the business-state fields compared by the prover, excluding surrogate IDs and delivery bookkeeping.
@@ -59,7 +63,7 @@ Equality here means equality of the business-state fields compared by the prover
 2. **Duplicate idempotency:** `H(H(S, e), e) = H(S, e)`. Concurrent duplicate delivery must also have the business effect of one successful delivery.
 3. **Crash-retry atomicity:** `retry(crash(H, S, e), e) = H(S, e)`. A failed attempt followed by retry must converge to one successful execution.
 
-The fixed proof matrix is `4! + 1 + 2 = 24 + 1 + 2 = 27` cells:
+The fixed verification matrix is `4! + 1 + 2 = 24 + 1 + 2 = 27` cells:
 
 | Cells | Schedule | What it checks |
 | --- | --- | --- |
@@ -84,13 +88,13 @@ The CLI prints `Gate PASS` for the vulnerable baseline because reproducing its e
 The partial patch fixes the race and both crash-retry cells, but still fails 18 ordering permutations.
 Timings depend on the machine and filesystem.
 
-Verified live runs: Muse Wonder produced patches that passed 27/27 in CEGIS round 1 with no reference solution (about 150 s per live run, both from the CLI and from the UI).
+Previously recorded live synthesis runs: Muse Wonder produced patches that passed 27/27 in CEGIS round 1 with no reference solution (about 150 s per live run, both from the CLI and from the UI). These are historical observations, not results from cached mode or this documentation pass.
 
 Live results vary, and a live Diagnose costs real credits.
 An offline verified cache exists so the demo never depends on the network: enable **Instant mode (cached)** to avoid model requests.
-Missing configuration, request failures, or unsuccessful synthesis also fall back to deterministic cached analysis and the reference patch.
+Missing configuration, request failures, or unsuccessful synthesis also fall back to deterministic cached analysis and the predefined example repair. This fallback is not generated live. Candidate acceptance is determined separately by the independent business contract across the configured schedules, regardless of whether the repair was synthesized live or loaded from cache.
 The UI labels **VERIFIED CACHE** versus **LIVE MODEL**, identifies the patch source separately, and reports whether Spark actually saw the diagram or used text-only input.
-The live observations above are project results; the measurements in the table were rerun for this README without invoking live models.
+The table records earlier local verification timings without live model calls; the live synthesis observations are separate historical project results.
 
 ## Meta models
 
@@ -134,7 +138,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-For a network-independent demo, set `DEMO_FALLBACK_CACHE=true` in your local `.env`; no model credential is required for Instant mode or deterministic proofs.
+For a network-independent demo, set `DEMO_FALLBACK_CACHE=true` in your local `.env`; no model credential is required for Instant mode or deterministic scenario verification.
 For live analysis, configure `MUSE_API_KEY` privately as described in `.env.example`, set `MUSE_BASE_URL` to your compatible service endpoint, and set `DEMO_FALLBACK_CACHE=false`.
 The example selects `muse-wonder-1.0`, `muse-spark-1.3`, and a 180-second request timeout.
 The client loads local `.env` settings without overriding existing process environment variables. Keep credentials out of commits and shared output.
@@ -177,7 +181,7 @@ python -m chaoshook_engine.cli live-patch-check
 ```
 
 `ping-muse` probes the configured models even when cache mode is enabled.
-For `live-patch-check`, disable cache mode; it synthesizes and proves a candidate in a temporary directory without installing it, and returns failure if live synthesis falls back to cache.
+For `live-patch-check`, disable cache mode; it synthesizes and verifies a candidate against the configured checks in a temporary directory without installing it, and returns failure if live synthesis falls back to cache.
 
 ## Repository map
 
@@ -186,6 +190,7 @@ For `live-patch-check`, disable cache mode; it synthesizes and proves a candidat
 | `target_app/` | Independent SQLAlchemy models, payload schemas, HMAC verification, and recorded outbox effects |
 | `target_app/handlers/` | Vulnerable, partial, reference, and hot-swappable active handlers |
 | `chaoshook_engine/runner.py` | Real-SQL 27-cell matrix and pytest export template |
+| `chaoshook_engine/scenario_spec.py` | Frozen independent business outcomes and executable acceptance predicates |
 | `chaoshook_engine/snapshot.py`, `interceptors.py`, `fixtures.py` | SQLite clones, business-state comparisons, scheduling hooks, and canonical signed events |
 | `chaoshook_engine/muse_client.py`, `patcher.py` | Model routing, compact counterexamples, CEGIS, isolated verification, installation, and rollback |
 | `chaoshook_engine/server.py`, `cli.py` | Local JSON API and terminal commands |

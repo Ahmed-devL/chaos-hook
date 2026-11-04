@@ -175,9 +175,9 @@ export default function App() {
             </div>
           </div>
           <div className="space-y-3 sm:text-right">
-            <p ref={scoreRef} role="status" aria-label="Algebraic proof score"
+            <p ref={scoreRef} role="status" aria-label="Configured verification check score"
               className={`max-w-3xl rounded-lg border px-4 py-3 font-mono text-xs font-semibold leading-relaxed tracking-wide transition-colors duration-700 motion-reduce:transition-none sm:text-sm ${report ? invariant ? 'border-emerald/50 bg-emerald/10 text-emerald shadow-lg shadow-emerald/5' : 'border-crimson/50 bg-crimson/10 text-crimson' : 'border-slate-700 text-slate-400'}`}>
-              {report ? `${report.passed_cells} / ${report.total_cells} CELLS VERIFIED - ${invariant ? 'ALGEBRAICALLY INVARIANT' : 'COMMUTATIVITY & IDEMPOTENCY VIOLATED'}` : 'AWAITING 27-CELL PROOF'}
+              {report ? `${report.passed_cells} / ${report.total_cells} CELLS VERIFIED - ${invariant ? `All ${report.total_cells} configured checks passed` : 'COMMUTATIVITY & IDEMPOTENCY VIOLATED'}` : 'AWAITING 27-CELL PROOF'}
             </p>
             <div className="flex flex-wrap items-center gap-3 sm:justify-end">
               <span className="font-mono text-xs tabular-nums text-slate-400">Execution time: {report ? `${report.duration_ms.toFixed(3)} ms` : '—'}</span>
