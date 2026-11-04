@@ -414,7 +414,7 @@ def main(argv=None) -> int:
         print(f"Exported pytest suite to {args.out}")
         if args.manifest:
             print(f"Exported verification manifest to {args.manifest}")
-            return 0 if (manifest["runtime_acceptance"]["accepted"] and
+            return 0 if (manifest["candidate_acceptance"]["accepted"] and
                          (not seeds or manifest["additional_scenarios"]["all_passed"] is True)) else 1
         return 0
     if args.command == "ping-muse":

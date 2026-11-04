@@ -10,6 +10,8 @@ from threading import RLock
 from time import perf_counter
 
 from fastapi import FastAPI, HTTPException
+from starlette.responses import JSONResponse
+from starlette.datastructures import Headers
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -18,14 +20,34 @@ from chaoshook_engine.patcher import (
     HANDLER_DIR, get_active_handler_status,
     verify_candidate_patch, active_installation, fresh_handler_module,
 )
-from chaoshook_engine.runner import export_pytest_code, run_algebraic_prover
+from chaoshook_engine.runner import export_pytest_code, run_algebraic_prover, run_authentication_admission
 from chaoshook_engine.scenario_spec import SCENARIO_SPEC
+
+
+LOCAL_UI_ORIGINS = {"http://localhost:5173", "http://127.0.0.1:5173"}
+
+
+class BrowserOriginGuard:
+    """Mitigate cross-origin browser writes; absent Origin permits local CLI use."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] == "http" and scope["path"].startswith("/api/")
+                and scope["method"] not in {"GET", "HEAD", "OPTIONS"}):
+            origins = Headers(scope=scope).getlist("origin")
+            if origins and (len(origins) != 1 or origins[0] not in LOCAL_UI_ORIGINS):
+                await JSONResponse({"detail": "Browser Origin is not allowed"}, status_code=403)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 app = FastAPI(title="The Brass Escapement — ChaosHook", version="0.1.0")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware, allow_origins=sorted(LOCAL_UI_ORIGINS), allow_methods=["*"], allow_headers=["*"],
 )
+
+app.add_middleware(BrowserOriginGuard)
 
 # Synchronous endpoints run in FastAPI's worker pool. Keep module reloads and
 # file mutations out of another request's proof or analysis.
@@ -34,6 +56,7 @@ app.state.prover_report = None
 app.state.prover_source = None
 app.state.analysis = None
 app.state.active_provenance = None
+app.state.authentication_admission = None
 app.state.model_routing = {
     "muse_wonder_model": WONDER, "muse_spark_model": SPARK,
     "used_fallback_cache": False,
@@ -61,8 +84,10 @@ def _prove(handler_status: dict, *, force: bool = False) -> dict:
         try:
             with fresh_handler_module(source) as module:
                 report = run_algebraic_prover(module.process_stripe_webhook)
+                admission = run_authentication_admission(module.process_stripe_webhook, sha256(source.encode()).hexdigest())
         except Exception:
             raise HTTPException(400, "Active source could not be loaded or proved") from None
+        app.state.authentication_admission = admission
         app.state.prover_report = report
         app.state.prover_source = source
         app.state.analysis = None
@@ -113,6 +138,7 @@ def _proof_response(handler_status: dict) -> dict:
     return {
         "status": "ok", "handler_status": handler_status, "prover_report": report,
         "verification_evidence": _verification_evidence(handler_status, report),
+        "authentication_admission": app.state.authentication_admission,
     }
 
 
@@ -126,6 +152,7 @@ def status() -> dict:
             "partial_patch_code": (HANDLER_DIR / "v1_partial_idempotent.py").read_text(encoding="utf-8"),
             "model_routing": dict(app.state.model_routing), "prover_report": report,
             "verification_evidence": _verification_evidence(handler_status, report),
+            "authentication_admission": app.state.authentication_admission,
         }
 
 
@@ -184,8 +211,9 @@ def _source_transaction(code):
 
 
 class _RejectedInstallation(Exception):
-    def __init__(self, report):
+    def __init__(self, report, admission):
         self.report = report
+        self.admission = admission
 
 
 @app.post("/api/patch")
@@ -216,8 +244,9 @@ def patch(body: PatchRequest | None = None) -> dict:
                             and len(report["cells"]) == 27
                             and all(c["id"] == index and c["passed"] is True
                                     for index, c in enumerate(report["cells"], 1)))
+                verified = verified and response["authentication_admission"]["passed"]
                 if not verified:
-                    raise _RejectedInstallation(report)
+                    raise _RejectedInstallation(report, response["authentication_admission"])
                 return {**response, "verified": verified}
         except _RejectedInstallation as exc:
             report = exc.report
@@ -225,7 +254,8 @@ def patch(body: PatchRequest | None = None) -> dict:
                     "candidate_sha256": sha256(code.encode("utf-8")).hexdigest(),
                     "passed_cells": report["passed_cells"], "total_cells": report["total_cells"],
                     "failed_cell_ids": [c["id"] for c in report["cells"] if not c["passed"]],
-                    "prover_report": report, "import_error": None}
+                    "prover_report": report, "import_error": None,
+                    "authentication_admission": exc.admission}
         except Exception:
             raise HTTPException(400, "Handler patch could not be loaded or proved; previous source restored") from None
 
@@ -254,8 +284,24 @@ def update_source(body: UpdateSourceRequest) -> dict:
         raise HTTPException(400, "Source code could not be compiled") from None
     with _lock:
         try:
+            verification = verify_candidate_patch(code)
+        except Exception:
+            raise HTTPException(400, "Source validation could not complete; previous source preserved") from None
+        admission = verification["authentication_admission"]
+        if verification["import_error"]:
+            raise HTTPException(400, "Handler source could not be loaded; previous source restored")
+        # Runtime-broken editor demonstrations remain allowed; they cannot process
+        # valid signed input either. Any candidate that processes valid requests
+        # must preserve rejection of every invalid request.
+        negatives = [c for c in admission["checks"] if c["case"] != "valid"]
+        if not all(c["passed"] for c in negatives):
+            raise HTTPException(400, "Handler failed authentication admission; previous source restored")
+        try:
             with _source_transaction(code) as handler_status:
                 app.state.active_provenance = None
-                return _proof_response(handler_status)
+                response = _proof_response(handler_status)
+                if not all(c["passed"] for c in response["authentication_admission"]["checks"] if c["case"] != "valid"):
+                    raise ValueError("Authentication rejection failed after installation")
+                return response
         except Exception:
             raise HTTPException(400, "Handler source could not be loaded or proved; previous source restored") from None

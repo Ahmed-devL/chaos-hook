@@ -3,6 +3,9 @@ import { LoaderCircle } from 'lucide-react';
 import { candidateSource } from './ProofMatrixGrid.jsx';
 
 function rejectionExplanation(rejection) {
+  if (rejection.authentication_admission?.passed === false && !rejection.import_error) {
+    return 'Authentication admission failed. The previous handler remains installed.';
+  }
   if (rejection.import_error) return 'The candidate could not be imported.';
   const failed = rejection.failed_cell_ids ?? [];
   const categories = [];
@@ -55,7 +58,8 @@ export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, o
         <footer className="mt-4">
           {rejection && <div role="alert" className="mb-3 rounded border border-crimson/50 bg-crimson/10 p-3 text-sm text-crimson">
             <p>Patch rejected by prover: {rejection.passed_cells}/{rejection.total_cells} cells pass</p>
-            <p>Failing cells: {rejection.failed_cell_ids?.join(', ') || 'not run (import failed)'}</p>
+            <p>Failing cells: {rejection.failed_cell_ids?.join(', ') || (rejection.import_error ? 'not run (import failed)' : 'none in the legacy matrix')}</p>
+            {rejection.authentication_admission && <p>Authentication admission: {rejection.authentication_admission.passed_check_count ?? 0}/{rejection.authentication_admission.configured_check_count ?? 24} checks passed (separate scope)</p>}
             <p>{rejectionExplanation(rejection)}</p>
             {rejection.import_error && <p className="mt-1 whitespace-pre-wrap break-words">{rejection.import_error}</p>}
           </div>}

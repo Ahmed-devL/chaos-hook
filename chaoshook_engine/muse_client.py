@@ -207,6 +207,8 @@ class MuseNeuroSymbolicClient:
             # the original report, and budget errors use the normal safe fallback.
             report = payload["prover_report"]
             view = counterexample_view(report)
+            if "authentication_admission" in report:
+                view["authentication_admission"] = report["authentication_admission"]
             if "import_error" in report:
                 view["import_error"] = report["import_error"]
             payload = {**payload, "prover_report": json.loads(
@@ -366,6 +368,7 @@ class MuseNeuroSymbolicClient:
             "regression_check_ids": previous_ids,
             "regression_passed_check_ids": [cell["id"] for cell in cells
                                              if cell["id"] in previous_ids and cell["passed"]],
+            "authentication_admission": deepcopy((verification or {}).get("authentication_admission")),
             "result": "accepted" if accepted else "rejected",
             "autonomous_repair": accepted and provenance == "live_model_response",
         }
@@ -405,7 +408,8 @@ class MuseNeuroSymbolicClient:
             cegis_rounds=[], candidate_attempts=[], selected_candidate=None,
             regression_evidence=[self._evidence_summary(prover_report)],
             verification_scope={
-                "acceptance": "legacy_27_cells", "synthesis_mode": "guided",
+                "acceptance": "legacy_27_cells_and_authentication_admission", "synthesis_mode": "guided",
+                "authentication_scope": "stripe-authentication-admission-v1",
                 "contract_sha256": sha256(json.dumps(asdict(SCENARIO_SPEC), sort_keys=True).encode()).hexdigest(),
                 "additional_scenario_evaluation": "separate_not_run",
                 "mutation_controls": "regression_only_not_acceptance",
@@ -471,6 +475,7 @@ class MuseNeuroSymbolicClient:
             payload["handler_code"] = candidate["patched_code"]
             payload["prover_report"] = {
                 **(verification["prover_report"] or {}), "import_error": import_error,
+                "authentication_admission": verification.get("authentication_admission"),
             }
         self._record_route("wonder", False,
                            f"CEGIS exhausted {max_rounds} rounds without a verified patch; "
@@ -620,6 +625,7 @@ def experiment_feedback(evidence):
     base = evidence["runtime_acceptance"]["run"]
     strict = evidence["strict_semantic"]
     return {
+        "authentication_admission": deepcopy(evidence.get("authentication_admission")),
         "legacy": {key: deepcopy(base[key]) for key in (
             "passed_check_ids", "failed_check_ids", "business_property_violations",
             "execution_errors", "synchronization_errors", "import_error", "verification_error")},

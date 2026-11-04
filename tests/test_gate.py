@@ -1547,7 +1547,17 @@ def _manifest_inputs(report, source=None):
     from hashlib import sha256
 
     source = source if source is not None else Path(v2_patched.__file__).read_text(encoding='utf-8')
-    return source, {'candidate_sha256': sha256(source.encode()).hexdigest(), 'prover_report': report}
+    from chaoshook_engine.patcher import fresh_handler_module
+    from chaoshook_engine.runner import run_authentication_admission
+    digest = sha256(source.encode()).hexdigest()
+    try:
+        with fresh_handler_module(source) as module:
+            admission = run_authentication_admission(module.process_stripe_webhook, digest)
+    except Exception:
+        admission = {'scope': 'stripe-authentication-admission-v1', 'candidate_sha256': digest,
+                     'executed_check_count': 0, 'passed': False, 'checks': []}
+    return source, {'candidate_sha256': digest, 'prover_report': report,
+                    'authentication_admission': admission}
 
 
 def test_manifest_hashes_and_executed_coverage(reports):
@@ -2892,3 +2902,164 @@ assert __spec__ is not None and __loader__ is not None and __file__
     assert result['verification_evidence']['provenance'] == 'cached_fallback'
     assert client.post('/api/prove').json()['prover_report']['passed_cells'] == 27
     assert client.post('/api/patch', json={'patched_code': source}).json()['verified']
+
+
+@pytest.fixture(scope='module')
+def authentication_controls():
+    from chaoshook_engine.patcher import qualify_semantic_candidate
+    prepared = Path(v2_patched.__file__).read_text()
+    unsigned = prepared.replace('    if not verify_stripe_signature(raw_body, sig_header):\n        raise ValueError("Invalid Stripe signature")\n', '')
+    return prepared, unsigned, qualify_semantic_candidate(unsigned)
+
+
+def test_authentication_removed_negative_control_preserves_historical_totals(authentication_controls):
+    _, _, evidence = authentication_controls
+    assert len(evidence['runtime_acceptance']['run']['passed_check_ids']) == 27
+    assert evidence['strict_semantic']['passed_check_count'] == 526
+    assert evidence['strict_semantic']['qualified']
+    assert not evidence['candidate_acceptance']['accepted']
+    assert not evidence['strict_qualification']['qualified']
+    auth = evidence['authentication_admission']
+    assert auth['candidate_sha256'] == evidence['candidate']['source_sha256']
+    assert auth['executed_check_count'] == 24 and auth['passed_check_count'] == 4
+    assert all(c['passed'] == (c['case'] == 'valid') for c in auth['checks'])
+    assert not any(c['state_unchanged'] for c in auth['checks'] if c['case'] != 'valid')
+
+
+def test_authentication_prepared_controls_and_deterministic_signatures(authentication_controls):
+    from chaoshook_engine.patcher import verify_candidate_patch
+    from chaoshook_engine.runner import authentication_inputs
+    from chaoshook_engine.fixtures import get_canonical_events
+    prepared, _, _ = authentication_controls
+    r = verify_candidate_patch(prepared)
+    assert r['verified'] and r['authentication_admission']['passed_check_count'] == 24
+    assert r['total_cells'] == 27
+    payload = get_canonical_events()[2]
+    assert authentication_inputs(payload, 1700000000) == authentication_inputs(payload, 1700000000)
+
+
+@pytest.mark.parametrize('write', ['balance', 'ledger', 'outbox', 'claims', 'subscription'])
+def test_authentication_observes_writes_even_when_candidate_raises(write):
+    from chaoshook_engine.patcher import fresh_handler_module
+    from chaoshook_engine.runner import run_authentication_admission
+    prepared = Path(v2_patched.__file__).read_text()
+    statements = {
+        'balance': "UPDATE users SET credit_balance = credit_balance + 1",
+        'ledger': "INSERT INTO credit_ledger(user_id,invoice_id,delta,reason) VALUES ('x','x',1,'x')",
+        'outbox': "INSERT INTO outbox_emails(user_id,template) VALUES ('x','x')",
+        'claims': "INSERT INTO webhook_events(event_id,event_type,created_ts,status) VALUES ('x','x',1,'processed')",
+        'subscription': "UPDATE subscriptions SET status='corrupted'",
+    }
+    source = prepared.replace('    if not verify_stripe_signature(raw_body, sig_header):\n        raise ValueError("Invalid Stripe signature")',
+        '    if not verify_stripe_signature(raw_body, sig_header):\n'
+        f'        session.execute(text({statements[write]!r}))\n'
+        '        raise ValueError("rejected after write")')
+    with fresh_handler_module(source) as module:
+        r = run_authentication_admission(module.process_stripe_webhook, 'test-source')
+    assert not r['passed']
+    assert all(not c['passed'] for c in r['checks'] if c['case'] != 'valid')
+
+
+@pytest.mark.parametrize('cached', [False, True])
+def test_authentication_failure_preserves_installation(source_editor, monkeypatch, authentication_controls, cached):
+    from chaoshook_engine import server, patcher
+    client, active = source_editor
+    _, unsigned, _ = authentication_controls
+    assert client.post('/api/patch').json()['verified']
+    before = active.read_bytes()
+    module = sys.modules[patcher._MODULE]
+    state = dict(server.app.state._state)
+    if cached:
+        original = Path.read_bytes
+        reference = patcher.HANDLER_DIR / 'v2_patched.py'
+        monkeypatch.setattr(Path, 'read_bytes', lambda p: unsigned.encode() if p == reference else original(p))
+    r = client.post('/api/patch', **({} if cached else {'json': {'patched_code': unsigned}})).json()
+    assert r['status'] == 'rejected' and not r['verified'] and r['passed_cells'] == 27
+    assert not r['authentication_admission']['passed']
+    assert active.read_bytes() == before and sys.modules[patcher._MODULE] is module
+    assert all(server.app.state._state[k] is v for k, v in state.items())
+
+
+@pytest.mark.parametrize('origin', ['https://untrusted.invalid', 'null', '', 'http://localhost:5173.evil.invalid'])
+@pytest.mark.parametrize('endpoint', ['reset', 'patch', 'diagnose', 'update-source', 'prove'])
+def test_browser_origin_rejection_precedes_every_endpoint_side_effect(source_editor, monkeypatch, origin, endpoint):
+    from chaoshook_engine import server
+    client, active = source_editor
+    before = active.read_bytes()
+    state = dict(server.app.state._state)
+    def forbidden(*args, **kwargs):
+        pytest.fail('Origin rejection must precede source access, evaluation, reset, and model invocation')
+    for name in ('get_active_handler_status', 'verify_candidate_patch', 'active_installation', 'MuseNeuroSymbolicClient', '_prove'):
+        monkeypatch.setattr(server, name, forbidden)
+    r = client.post('/api/' + endpoint, headers={'Origin': origin})
+    assert r.status_code == 403
+    assert active.read_bytes() == before
+    assert all(server.app.state._state[k] is v for k, v in state.items())
+
+
+@pytest.mark.parametrize('origin', [None, 'http://localhost:5173', 'http://127.0.0.1:5173'])
+def test_browser_origin_allows_documented_ui_and_originless_cli(source_editor, origin):
+    client, _ = source_editor
+    r = client.post('/api/patch', headers={} if origin is None else {'Origin': origin})
+    assert r.status_code == 200 and r.json()['verified']
+    r = client.post('/api/reset', headers={} if origin is None else {'Origin': origin})
+    assert r.status_code == 200 and r.json()['prover_report']['passed_cells'] == 6
+
+
+def test_authentication_admission_is_behavioral_and_source_bound(authentication_controls):
+    from chaoshook_engine.patcher import verify_candidate_patch
+    from chaoshook_engine.runner import authentication_admission_passed
+    prepared, _, _ = authentication_controls
+    source = prepared.replace('import verify_stripe_signature', 'import verify_stripe_signature as check_auth').replace(
+        'if not verify_stripe_signature(', 'if not check_auth(')
+    r = verify_candidate_patch(source)
+    assert r['verified']
+    auth = r['authentication_admission']
+    assert authentication_admission_passed(auth, r['candidate_sha256'])
+    assert not authentication_admission_passed(auth, 'different-source')
+    assert not authentication_admission_passed({**auth, 'checks': auth['checks'][:1] * 24}, r['candidate_sha256'])
+    assert not authentication_admission_passed(None, r['candidate_sha256'])
+
+
+def test_origin_rejects_duplicate_headers_before_models(source_editor, monkeypatch):
+    from chaoshook_engine import server
+    client, _ = source_editor
+    monkeypatch.setattr(server, 'MuseNeuroSymbolicClient', lambda: pytest.fail('must not invoke models'))
+    response = client.post('/api/diagnose', headers=[('Origin', 'http://localhost:5173'), ('Origin', 'http://localhost:5173')])
+    assert response.status_code == 403
+
+
+def test_editor_rejects_authentication_removal_without_losing_state(source_editor, authentication_controls):
+    from chaoshook_engine import server, patcher
+    client, active = source_editor
+    _, unsigned, _ = authentication_controls
+    client.post('/api/patch')
+    before, module = active.read_bytes(), sys.modules[patcher._MODULE]
+    state = dict(server.app.state._state)
+    assert client.post('/api/update-source', json={'source_code': unsigned}).status_code == 400
+    assert active.read_bytes() == before and sys.modules[patcher._MODULE] is module
+    assert all(server.app.state._state[k] is v for k, v in state.items())
+
+
+def test_authentication_manifest_redacts_free_text_and_fails_closed(authentication_controls):
+    from copy import deepcopy
+    from chaoshook_engine.runner import export_verification_manifest
+    from chaoshook_engine.patcher import verify_candidate_patch
+    prepared, _, _ = authentication_controls
+    r = verify_candidate_patch(prepared)
+    r['authentication_admission']['prompt'] = 'never-export-admission-secret'
+    r['authentication_admission']['checks'][0]['trace'] = 'never-export-admission-secret'
+    manifest = export_verification_manifest(prepared, r)
+    assert manifest['candidate_acceptance']['accepted']
+    assert 'never-export-admission-secret' not in json.dumps(manifest)
+    for tamper in ('missing', 'hash', 'duplicate'):
+        changed = deepcopy(r)
+        if tamper == 'missing':
+            changed.pop('authentication_admission')
+        elif tamper == 'hash':
+            changed['authentication_admission']['candidate_sha256'] = 'different-source'
+        else:
+            changed['authentication_admission']['checks'] = changed['authentication_admission']['checks'][:1] * 24
+        manifest = export_verification_manifest(prepared, changed)
+        assert not manifest['candidate_acceptance']['accepted']
+        assert not manifest['authentication_admission']['passed']

@@ -647,3 +647,47 @@ reconciled. Invoice IDs are assumed global within the synthetic single Stripe
 account; a multi-account deployment needs provider/account identity in the key.
 This is finite synthetic evidence, not a production database or process/power-loss
 proof. The existing authoritative, distinct timestamp assumptions still apply.
+
+### Authentication admission and browser-origin protection
+
+Candidate acceptance now requires `stripe-authentication-admission-v1` in addition
+to the legacy matrix. This separate scope contains 24 real-SQL checks: for each
+of checkout, subscription creation, invoice payment, and deletion, five invalid
+requests must be rejected without changing any business row or event claim, and
+one correctly signed request must commit the independently specified effect.
+The negative cases are an absent header (empty string at the handler interface),
+a malformed header, an incorrect synthetic signing key, a signature for different
+body bytes, and an expired timestamp. The current signature helper already
+requires one timestamp, at least one valid v1 HMAC, and a 300-second clock tolerance.
+Admission signs fixtures with the existing synthetic lab secret; wrong-key
+fixtures use a distinct fixed test secret. Signatures are deterministic given the
+payload and captured signing time; expired fixtures are 24 hours older. No Stripe
+service is contacted. Evidence retains no signatures, secrets or signing times.
+
+The 27-cell matrix and 526-check strict contract retain their original totals and
+meanings. `runtime_acceptance` remains explicitly scoped to `legacy_27_only`;
+`authentication_admission` reports the new source-hash-bound checks, and
+`candidate_acceptance.accepted` is the conjunction. `verified`, seeded
+qualification, strict overall qualification, and manifest-export exit status
+require admission. Missing admission evidence cannot qualify a candidate. Existing
+historical trial records and candidate hashes are not rewritten or retroactively
+certified. Muse retry feedback includes admission failures as separate evidence.
+The patch dialog reports admission rejection separately from passing matrix cells.
+
+Both explicit and cached repair candidates use the shared fresh-source verifier
+and transactional installation path. Admission failures preserve the previous
+installation and provenance. The live editor remains an unqualified fault lab:
+it may save callable handlers that fail valid processing, including the existing
+runtime-error demonstration, but it rejects candidates that fail the negative
+signature checks. Neither a saved edit nor a legacy score alone certifies a repair.
+Fresh namespaces do not sandbox candidate Python or its imports.
+
+For non-read-only `/api/` requests, the server accepts explicit browser origins
+`http://localhost:5173` and `http://127.0.0.1:5173`. Every other explicit Origin,
+including `null`, empty values and duplicate Origin headers, receives HTTP 403
+before source access, candidate evaluation, reset, installation or model-client
+creation. Requests without an Origin remain allowed for intentional local CLI
+clients and existing API scripts. CORS still controls browser response access;
+the server-side origin guard independently blocks these writes. Origin validation
+is a browser-request mitigation, not complete authentication: arbitrary local
+clients can omit or forge Origin. Keep the trusted development service local.

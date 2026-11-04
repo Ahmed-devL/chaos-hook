@@ -52,13 +52,17 @@ def fresh_handler_module(code):
 
 def verify_candidate_patch(code: str, *, strict_semantic=False) -> dict:
     """Import and prove a candidate outside the repo without installing it."""
-    from chaoshook_engine.runner import run_algebraic_prover
+    from chaoshook_engine.runner import run_algebraic_prover, run_authentication_admission, AUTHENTICATION_SCOPE
 
     result = {"verified": False, "passed_cells": 0, "total_cells": 27,
               "failed_cell_ids": [], "prover_report": None, "import_error": None,
               "candidate_sha256": sha256(code.encode("utf-8")).hexdigest(),
               "provenance": "prepared", "configured_check_ids": list(range(1, 28)),
               "executed_check_ids": []}
+    result["authentication_admission"] = {
+        "scope": AUTHENTICATION_SCOPE, "candidate_sha256": result["candidate_sha256"],
+        "configured_check_count": 24, "executed_check_count": 0,
+        "passed_check_count": 0, "passed": False, "checks": []}
     with TemporaryDirectory(prefix="chaoshook-candidate-", dir="/tmp") as directory:
         path = Path(directory) / "candidate.py"
         path.write_text(code, encoding="utf-8")
@@ -79,6 +83,9 @@ def verify_candidate_patch(code: str, *, strict_semantic=False) -> dict:
                 executed_check_ids=[cell["id"] for cell in report["cells"]],
                 failed_cell_ids=[cell["id"] for cell in report["cells"] if not cell["passed"]],
             )
+            admission = run_authentication_admission(handler, result["candidate_sha256"])
+            result["authentication_admission"] = admission
+            result["verified"] = result["verified"] and admission["passed"]
             if strict_semantic:
                 from chaoshook_engine.runner import run_semantic_challenges
                 result["strict_semantic"] = run_semantic_challenges(handler)
@@ -323,6 +330,8 @@ def qualify_candidate_patch(code: str, seeds, *, contract=SCENARIO_SPEC, candida
     completed_seeds = [run["seed"] for run in runs if completed(run)]
     if not base["accepted"]:
         status = "not_evaluated"
+    elif not manifest["candidate_acceptance"]["accepted"]:
+        status = "failed"
     elif completed_seeds != seeds:
         status = "incomplete_or_errored"
     else:
@@ -330,7 +339,7 @@ def qualify_candidate_patch(code: str, seeds, *, contract=SCENARIO_SPEC, candida
                                  or run["execution_errors"] or run["synchronization_errors"] for run in runs) else "passed"
     manifest["qualification"] = {
         "label": "additional seeded qualification", "base_verification_status": base_status,
-        "status": status, "qualified": status == "passed", "completed_seeds": completed_seeds,
+        "status": status, "qualified": status == "passed" and manifest["candidate_acceptance"]["accepted"], "completed_seeds": completed_seeds,
         "not_evaluated_reason": f"base_verification_{base_status}" if not base["accepted"] else None,
         "errors": errors,
     }
@@ -361,8 +370,8 @@ def qualify_semantic_candidate(code: str) -> dict:
         "error": "candidate_import_error" if verification.get("import_error") else "verification_error",
     }
     manifest["strict_qualification"] = {
-        "qualified": manifest["runtime_acceptance"]["accepted"] and bool(semantic and semantic["qualified"]),
-        "requires": ["legacy_27", SEMANTIC_CONTRACT_ID],
+        "qualified": manifest["runtime_acceptance"]["accepted"] and bool(semantic and semantic["qualified"]) and manifest["candidate_acceptance"]["accepted"],
+        "requires": ["legacy_27", SEMANTIC_CONTRACT_ID, "stripe-authentication-admission-v1"],
         "installation_default": "legacy_flow_unchanged; strict_requires_explicit_option",
     }
     # Retain the legacy manifest's schedule scope; semantic counts are separate.

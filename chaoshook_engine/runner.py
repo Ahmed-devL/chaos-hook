@@ -153,7 +153,12 @@ def export_verification_manifest(code: str, verification: dict, *, evaluations=(
                 and all(run["executed_schedule_count"] == 27 for run in additional))
     accepted = (legacy["passed_check_ids"] == list(range(1, 28))
                 and not legacy["import_error"] and not legacy["verification_error"])
+    admission = verification.get("authentication_admission")
+    auth_passed = authentication_admission_passed(admission, source_hash)
     return {
+        "authentication_admission": authentication_admission_evidence(admission, source_hash),
+        "candidate_acceptance": {"accepted": accepted and auth_passed,
+                                 "requires": ["legacy_27", AUTHENTICATION_SCOPE]},
         "schema_version": 1,
         "contract": {"identifier": "novacloud-four-event-lifecycle-v1",
                      "sha256": _json_hash(asdict(SCENARIO_SPEC)),
@@ -482,3 +487,143 @@ def run_semantic_challenges(handler_fn):
             "executed_check_count": sum(r["executed_check_count"] for r in runs),
             "passed_check_count": sum(r["passed_check_count"] for r in runs),
             "qualified": bool(runs) and all(r["passed"] for r in runs), "runs": runs}
+
+
+AUTHENTICATION_SCOPE = "stripe-authentication-admission-v1"
+AUTHENTICATION_CASES = ("missing", "malformed", "wrong_key", "modified_body", "expired", "valid")
+
+
+def authentication_admission_passed(admission, source_hash):
+    expected = [f"{n}:{case}" for n in range(1, 5) for case in AUTHENTICATION_CASES]
+    return bool(isinstance(admission, dict) and admission.get("scope") == AUTHENTICATION_SCOPE
+                and admission.get("candidate_sha256") == source_hash
+                and admission.get("passed") is True
+                and admission.get("configured_check_count") == 24
+                and admission.get("executed_check_count") == 24
+                and admission.get("passed_check_count") == 24
+                and [c.get("id") for c in admission.get("checks", [])] == expected
+                and all(c.get("passed") is True for c in admission["checks"]))
+
+
+def authentication_admission_evidence(admission, source_hash):
+    """Project fixed identifiers and booleans only; never export arbitrary values."""
+    expected = [f"{n}:{case}" for n in range(1, 5) for case in AUTHENTICATION_CASES]
+    records = {}
+    if (isinstance(admission, dict) and admission.get("candidate_sha256") == source_hash
+            and admission.get("scope") == AUTHENTICATION_SCOPE):
+        for check in admission.get("checks", []):
+            identifier = check.get("id")
+            if identifier in expected and identifier not in records:
+                records[identifier] = check
+    checks = []
+    for identifier in expected:
+        if identifier not in records:
+            continue
+        check = records[identifier]
+        number, case = identifier.split(":")
+        checks.append({"id": identifier, "case": case,
+                       "event_type": get_canonical_events()[int(number) - 1]["type"],
+                       **{key: check.get(key) if type(check.get(key)) is bool else None
+                          for key in ("passed", "rejected", "state_unchanged")}})
+    return {"scope": AUTHENTICATION_SCOPE, "candidate_sha256": source_hash,
+            "configured_check_count": 24, "executed_check_count": len(checks),
+            "passed_check_count": sum(c["passed"] is True for c in checks),
+            "passed": authentication_admission_passed(admission, source_hash), "checks": checks}
+
+
+def authentication_inputs(payload, timestamp):
+    """Synthetic signatures deterministic for payload and supplied signing time.
+
+    Capture real time once per admission run, as the public validator uses wall
+    time. Retained evidence contains neither timestamps, signatures nor secrets.
+    """
+    import hashlib
+    import hmac
+    from target_app.hmac_auth import WEBHOOK_SECRET
+    from chaoshook_engine.fixtures import serialize_event
+
+    raw = serialize_event(payload)
+    def signature(body, ts, key=WEBHOOK_SECRET):
+        mac = hmac.new(key.encode(), str(ts).encode() + b'.' + body, hashlib.sha256).hexdigest()
+        return f"t={ts},v1={mac}"
+    valid = signature(raw, timestamp)
+    return {
+        "missing": (raw, ""), "malformed": (raw, "t=invalid,v1=invalid"),
+        "wrong_key": (raw, signature(raw, timestamp, "whsec_admission_wrong_key")),
+        "modified_body": (raw + b' ', valid),
+        "expired": (raw, signature(raw, timestamp - 86400)),
+        "valid": (raw, valid),
+    }
+
+
+def run_authentication_admission(handler_fn, source_hash):
+    """Separate behavioral scope: 20 rejected deliveries and four valid controls.
+
+    Observe all business columns and event claims, both before caller rollback
+    and after session close. No reference handler or static source scan is used.
+    """
+    import time
+    from sqlalchemy import select
+    from chaoshook_engine.fixtures import scenario_from_seed
+    from chaoshook_engine.scenario_spec import semantic_expected_state
+    from chaoshook_engine.snapshot import extract_semantic_state
+    from target_app.models import Subscription, WebhookEvent
+
+    scenario = scenario_from_seed(9182)
+    timestamp = int(time.time())
+    checks = []
+    def snapshot(session):
+        return {table.name: sorted((tuple(row) for row in session.execute(select(table))), key=repr)
+                for table in Base.metadata.sorted_tables}
+    with TemporaryDirectory(prefix="chaoshook-auth-") as folder:
+        for number, payload in enumerate(get_canonical_events(scenario)):
+            for case, (raw, signature) in authentication_inputs(payload, timestamp).items():
+                with _cell(Path(folder) / f"{number}-{case}.db", [], scenario=scenario) as engine:
+                    if case != "valid":
+                        # An existing row makes an unauthenticated deletion or
+                        # overwrite observable.
+                        with Session(engine) as session:
+                            session.add(Subscription(id=scenario.subscription_id, user_id=scenario.user_id,
+                                stripe_customer_id=scenario.customer_id, status="active",
+                                current_period_end=scenario.current_period_end, last_event_ts=0))
+                            session.commit()
+                    with Session(engine) as session:
+                        before = snapshot(session)
+                    rejected, error = False, False
+                    with Session(engine) as session:
+                        try:
+                            response = handler_fn(session, raw, signature)
+                            rejected = isinstance(response, dict) and response.get("status") in {
+                                "rejected", "invalid_signature", "unauthorized"}
+                        except Exception:
+                            rejected, error = True, True
+                        # Inspect pending ORM writes too; rollback is not evidence
+                        # that the candidate itself rejected without side effects.
+                        try:
+                            session.flush()
+                            unchanged = snapshot(session) == before
+                        except Exception:
+                            unchanged = False
+                        if case == "valid":
+                            try:
+                                actual = extract_semantic_state(session, scenario)
+                                claims = [(e.event_id, e.event_type, e.created_ts, e.status)
+                                          for e in session.scalars(select(WebhookEvent))]
+                                valid_state = snapshot(session)
+                                correct = (actual == semantic_expected_state(scenario, [payload]) and claims == [
+                                    (payload['id'], payload['type'], payload['created'], 'processed')])
+                            except Exception:
+                                valid_state, correct = None, False
+                    with Session(engine) as session:
+                        durable_unchanged = snapshot(session) == before
+                        if case == "valid":
+                            correct = correct and snapshot(session) == valid_state
+                    passed = (correct and not error and not rejected if case == "valid"
+                              else rejected and unchanged and durable_unchanged)
+                    checks.append({"id": f"{number + 1}:{case}", "event_type": payload['type'],
+                                   "case": case, "passed": bool(passed),
+                                   "rejected": rejected, "state_unchanged": unchanged and durable_unchanged})
+    return {"scope": AUTHENTICATION_SCOPE, "candidate_sha256": source_hash,
+            "configured_check_count": 24, "executed_check_count": len(checks),
+            "passed_check_count": sum(c['passed'] for c in checks),
+            "passed": len(checks) == 24 and all(c['passed'] for c in checks), "checks": checks}
