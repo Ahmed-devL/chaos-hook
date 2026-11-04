@@ -1,7 +1,10 @@
 """Execute the 27 real-SQL adversarial schedules against isolated SQLite cells."""
 
 from contextlib import closing, contextmanager
+from dataclasses import asdict
+from hashlib import sha256
 from itertools import permutations
+import json
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -21,6 +24,155 @@ from chaoshook_engine.snapshot import (
     create_cell_engine, extract_comparable_state, seed_initial_state,
 )
 from target_app.models import Base
+
+
+def _json_hash(value) -> str:
+    # Match the contract hashes already used by Muse audits and API evidence.
+    return sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def candidate_export_provenance(code: str, audit: dict | None = None) -> str:
+    """Use a supplied audit only when it describes these exact source/contract bytes.
+
+    This binds a local provenance record; it does not authenticate its author.
+    No audit means prepared source, even when it matches the cached reference.
+    """
+    if audit is None:
+        return "prepared"
+    record = audit.get("selected_candidate", audit)
+    if (not isinstance(record, dict)
+            or record.get("candidate_sha256") != sha256(code.encode("utf-8")).hexdigest()
+            or record.get("contract_sha256") != _json_hash(asdict(SCENARIO_SPEC))
+            or record.get("provenance") not in {"prepared", "cached_fallback", "live_model_response"}):
+        raise ValueError("Candidate audit must match the source, contract, and known provenance")
+    return record["provenance"]
+
+
+def _manifest_run(report, scenario, *, import_error=None, verification_error=None, label=None):
+    """Project actual cells only. Never copy untrusted messages, SQL, or values."""
+    payloads = get_canonical_events(scenario)
+    fields = {
+        "user.id", "user.plan_tier", "user.credit_balance", "user.welcome_email_count",
+        "subscription.id", "subscription.status", "subscription.current_period_end",
+        "credit_ledger_rows", "credit_ledger_sum", "credit_ledger.identity",
+        "outbox_emails_count", "outbox_emails.identity", "users.identity", "subscriptions.identity",
+    }
+    user_fields = {}
+    for index, user in enumerate(scenario.initial_users()):
+        role = "primary" if index == 0 else "bystander"
+        user_fields.update({f"users.{user['id']}.{key}": f"users.{role}.{key}" for key in user})
+    cells = sorted((report or {}).get("cells", []), key=lambda c: c["id"])
+    ids = [cell["id"] for cell in cells]
+    if len(set(ids)) != len(ids) or any(type(i) is not int or i not in range(1, 28) for i in ids):
+        raise ValueError("Report contains invalid or duplicate executed schedule IDs")
+    violations, execution, synchronization = [], [], []
+    for cell in cells:
+        error_counts = {}
+        properties = set()
+        for violation in cell.get("property_violations", []):
+            field = violation.get("field")
+            if field != "execution.errors":
+                properties.add(field if field in fields else user_fields.get(field, "unrecognized_business_property"))
+                continue
+            for error in violation.get("actual", []):
+                # Stable codes retain failure evidence without exception text,
+                # SQL parameters, environment values, or authentication material.
+                if error == "Both workers did not reach the idempotency SQL barrier":
+                    code = "barrier_not_reached"
+                elif error == "RuntimeError: SQL barrier requires two RaceWorker threads":
+                    code = "barrier_broken"
+                elif error == "Expected mid-handler crash was not injected":
+                    code = "crash_not_injected"
+                else:
+                    code = "handler_execution_error"
+                error_counts[code] = error_counts.get(code, 0) + 1
+        violations.extend({"check_id": cell["id"], "property": field} for field in sorted(properties))
+        for code, count in sorted(error_counts.items()):
+            destination = execution if code == "handler_execution_error" else synchronization
+            destination.append({"check_id": cell["id"], "code": code, "count": count})
+    return {
+        "scenario_id": "legacy" if scenario.seed is None else f"seed:{scenario.seed}",
+        "seed": scenario.seed,
+        "label": label if label in {"evaluation", "held-out"} else "acceptance",
+        "scenario_sha256": _json_hash(asdict(scenario)),
+        "fixture_identifiers": {
+            "event_ids": list(scenario.event_ids), "user_ids": [u["id"] for u in scenario.initial_users()],
+            "customer_id": scenario.customer_id, "checkout_id": scenario.checkout_id,
+            "subscription_id": scenario.subscription_id, "invoice_id": scenario.invoice_id,
+        },
+        "fixture_sha256": _json_hash({"initial_users": scenario.initial_users(), "events": payloads}),
+        "executed_schedule_ids": ids, "executed_schedule_count": len(ids),
+        "passed_check_ids": [cell["id"] for cell in cells if cell["passed"]],
+        "failed_check_ids": [cell["id"] for cell in cells if not cell["passed"]],
+        "not_evaluated_check_ids": [i for i in range(1, 28) if i not in ids],
+        "business_property_violations": violations,
+        "execution_errors": execution, "synchronization_errors": synchronization,
+        "import_error": "candidate_import_error" if import_error else None,
+        "verification_error": "verification_error" if verification_error else None,
+    }
+
+
+def export_verification_manifest(code: str, verification: dict, *, evaluations=(),
+                                 requested_seeds=(), candidate_audit=None) -> dict:
+    """Build deterministic JSON evidence from existing verifier/evaluation results.
+
+    No execution or model calls occur here. Timings/timestamps and free text are
+    deliberately excluded. Mutation regression results never enter acceptance.
+    """
+    from chaoshook_engine.fixtures import scenario_from_seed
+
+    source_hash = sha256(code.encode("utf-8")).hexdigest()
+    provenance = candidate_export_provenance(code, candidate_audit)
+    if verification.get("candidate_sha256") != source_hash:
+        raise ValueError("Verification source hash does not match candidate")
+    legacy = _manifest_run(verification.get("prover_report"), SCENARIO_SPEC,
+                           import_error=verification.get("import_error"),
+                           verification_error=verification.get("verification_error"))
+    additional = []
+    seeds = list(requested_seeds)
+    if len(set(seeds)) != len(seeds) or any(type(seed) is not int for seed in seeds):
+        raise ValueError("Requested seeds must be distinct integers")
+    seen = set()
+    for evaluation in evaluations:
+        if evaluation.get("candidate_sha256") != source_hash:
+            raise ValueError("Evaluation source hash does not match candidate")
+        for item in evaluation.get("evaluations", []):
+            seed = item["seed"]
+            if seed not in seeds or seed in seen:
+                raise ValueError("Evaluation must match a distinct requested seed")
+            seen.add(seed)
+            scenario = scenario_from_seed(seed)
+            if _json_hash(item["scenario"]) != _json_hash(asdict(scenario)):
+                raise ValueError("Evaluation fixture does not match the seeded scenario")
+            additional.append(_manifest_run(item.get("prover_report"), scenario, label=item["label"],
+                                            import_error=item.get("import_error"),
+                                            verification_error=item.get("verification_error")))
+    additional.sort(key=lambda run: run["seed"])
+    evaluated_seeds = {run["seed"] for run in additional if run["executed_schedule_count"]}
+    complete = (bool(seeds) and seen == set(seeds)
+                and all(run["executed_schedule_count"] == 27 for run in additional))
+    accepted = (legacy["passed_check_ids"] == list(range(1, 28))
+                and not legacy["import_error"] and not legacy["verification_error"])
+    return {
+        "schema_version": 1,
+        "contract": {"identifier": "novacloud-four-event-lifecycle-v1",
+                     "sha256": _json_hash(asdict(SCENARIO_SPEC)),
+                     "oracle_source_sha256": sha256(Path(__file__).with_name("scenario_spec.py").read_bytes()).hexdigest()},
+        "candidate": {"source_sha256": source_hash, "provenance": provenance,
+                      "provenance_basis": "supplied_hash_bound_audit" if candidate_audit is not None else "prepared_source"},
+        "runtime_acceptance": {"accepted": accepted, "scope": "legacy_27_only", "run": legacy},
+        "additional_scenarios": {
+            "evaluated": any(run["executed_schedule_count"] for run in additional),
+            "requested_seeds": sorted(seeds), "runs": additional,
+            "not_evaluated_seeds": sorted(set(seeds) - evaluated_seeds),
+            "status": ("completed" if complete else "incomplete" if evaluated_seeds else "not_evaluated"),
+            "all_passed": (all(run["passed_check_ids"] == list(range(1, 28)) for run in additional)
+                           if complete else None),
+        },
+        "executed_schedule_count": sum(run["executed_schedule_count"] for run in [legacy, *additional]),
+        "mutation_controls": {"status": "not_evaluated", "scope": "regression_only_not_acceptance"},
+        "redaction": "property_identifiers_and_error_codes_only; no_source_sql_prompts_or_error_messages",
+    }
 
 
 def export_pytest_code() -> str:

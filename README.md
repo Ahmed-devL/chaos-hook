@@ -173,6 +173,92 @@ The exported suite imports the active handler and runs the prover once through a
 It deliberately fails against the vulnerable baseline; all 27 tests pass when the active handler is verified.
 `GET /api/export-pytest` returns the same source in the `filename` and `pytest_code` fields.
 
+### Reproducible verification manifest (schema version 1)
+
+The existing regression export optionally runs verification and writes a JSON
+manifest alongside the unchanged pytest source. It uses `verify_candidate_patch`
+for the legacy acceptance gate and `evaluate_candidate_patch` for explicitly
+requested additional seeds. It makes no Muse requests and never installs source:
+
+```bash
+.venv/bin/python -m chaoshook_engine.cli export-pytest \
+  --out /tmp/test_webhook_invariance.py \
+  --manifest /tmp/verification.json \
+  --source target_app/handlers/v2_patched.py
+```
+
+Omit `--source` to verify a frozen copy of `active_handler.py`. Append
+`--seed 101 --seed 202` to execute 27 additional schedules per seed. Without
+`--seed`, additional scenarios have `evaluated: false`, `status: not_evaluated`,
+and `all_passed: null`. These are separate evaluation results and do not affect
+`runtime_acceptance.accepted`, which retains the existing legacy 27/27 criterion.
+Export labels additional inputs `evaluation`; it does not infer held-out status
+or consume the separate `evaluate --history` workflow. Mutation controls are
+marked `not_evaluated` and `regression_only_not_acceptance`; this command does not
+run or import the pytest mutation summary.
+
+Exit code is 0 when legacy acceptance and all requested additional evaluations
+pass; otherwise it is 1, with both exports still written. Argument errors use
+argparse's exit code 2. Plain `export-pytest --out ...` keeps its previous
+read-only behavior and does not execute verification. `/api/export-pytest`, all
+existing API fields, verification criteria, and the React UI are unchanged.
+The generated pytest suite still tests the active handler **when pytest runs**;
+the manifest describes the source snapshot chosen at export time. `--source`
+does not install that source or embed it in the generated suite. Run the suite
+from a checkout of this project (or with its packages on the Python path).
+
+Candidate provenance defaults to `prepared`, including source matching the
+example repair. To preserve a recorded origin, append
+`--candidate-audit /tmp/candidate-audit.json`. Supply an existing individual
+CEGIS candidate record or the existing `model_routing` object containing a
+`selected_candidate`. Its source SHA-256, contract hash, and known provenance
+(`prepared`, `cached_fallback`, or `live_model_response`) must match; stale or
+unknown records are rejected before execution. Only the provenance enum is
+exported. `provenance_basis` identifies supplied audit records; these local
+records are caller-supplied evidence, not authenticated proof of model authorship.
+The tool never infers live generation from filenames or matching reference code.
+
+The manifest includes:
+
+- The contract identifier, existing contract SHA-256, and the independent
+  oracle source file's SHA-256. Contract/scenario hashes use UTF-8
+  `json.dumps(asdict(scenario), sort_keys=True)` (default JSON separators).
+- SHA-256 of the exact frozen UTF-8 candidate bytes, preserving CRLF newlines.
+- Scenario seeds, fixture identifiers, scenario hashes, and fixture hashes over
+  `{"initial_users": scenario.initial_users(), "events": get_canonical_events(scenario)}`
+  using the same JSON hashing convention. Authentication signatures are excluded.
+- Per-scenario executed schedule IDs and counts, passed/failed check IDs,
+  unevaluated check IDs, business-property violation identifiers, and execution
+  and synchronization error codes/counts. Schedule IDs retain the existing
+  mapping: 1–24 lexicographic permutations of e1–e4, 25 the duplicate SQL barrier,
+  26 the invoice crash/retry, and 27 the checkout crash/retry.
+- Separate legacy acceptance, additional evaluation status, and mutation scope.
+
+Only cells in returned prover reports count as executed. Summary totals and
+configured schedule lists cannot manufacture passes. Import failures record zero
+executed checks. Fatal verifier errors record a generic error code and no check
+results for the interrupted scenario because the runner returns reports only on
+completion; earlier completed additional scenarios remain recorded. This is a
+completed-result export, not an interruption journal or resumable run log.
+
+Serialization sorts keys, schedule IDs, properties, errors, and seeds. It includes
+no timestamps or durations, so identical inputs and executed outcomes produce
+byte-identical files regardless of temporary paths, thread ordering, or signing
+time. This does not freeze the execution environment or guarantee arbitrary
+candidate code is deterministic. Keep the source and project revision to replay;
+the manifest does not bundle them or dependencies. The existing finite-scenario,
+SQLite, trusted-local-code execution limitations still apply.
+
+Redaction uses an allowlist, not secret-pattern matching: raw source, prompts,
+SQL, candidate/model messages, environment values, headers, exception text, and
+expected/actual violation values are never copied. Business violations retain
+only known property names and check IDs; account-specific field paths normalize
+to `primary`/`bystander`, and unknown names become `unrecognized_business_property`.
+Errors retain counts and fixed codes (`handler_execution_error`,
+`barrier_not_reached`, `barrier_broken`, `crash_not_injected`,
+`candidate_import_error`, `verification_error`). Consult the local report/UI for
+detailed values and traces; the portable manifest deliberately omits them.
+
 Optional live checks, which make billable network requests:
 
 ```bash

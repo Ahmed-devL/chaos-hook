@@ -1541,3 +1541,290 @@ def test_judge_evidence_reports_entity_corruption_from_real_seeded_run(mutation_
     properties = {item['id']: item for item in evidence['business_properties']}
     assert properties['credits']['failed'] == properties['entities']['failed'] == 27
     assert evidence['execution_error_cells'] == 0
+
+
+def _manifest_inputs(report, source=None):
+    from hashlib import sha256
+
+    source = source if source is not None else Path(v2_patched.__file__).read_text(encoding='utf-8')
+    return source, {'candidate_sha256': sha256(source.encode()).hexdigest(), 'prover_report': report}
+
+
+def test_manifest_hashes_and_executed_coverage(reports):
+    from dataclasses import asdict
+    from hashlib import sha256
+    from chaoshook_engine.fixtures import get_canonical_events
+    from chaoshook_engine.runner import export_verification_manifest
+    from chaoshook_engine import scenario_spec
+
+    source, verification = _manifest_inputs(reports['patched'])
+    manifest = export_verification_manifest(source, verification)
+    digest = lambda value: sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+    assert manifest['schema_version'] == 1
+    assert manifest['contract']['sha256'] == digest(asdict(SCENARIO_SPEC))
+    assert manifest['contract']['oracle_source_sha256'] == sha256(Path(scenario_spec.__file__).read_bytes()).hexdigest()
+    assert manifest['candidate'] == {
+        'source_sha256': sha256(source.encode()).hexdigest(), 'provenance': 'prepared',
+        'provenance_basis': 'prepared_source',
+    }
+    acceptance = manifest['runtime_acceptance']
+    assert acceptance['accepted'] and acceptance['scope'] == 'legacy_27_only'
+    run = acceptance['run']
+    assert run['scenario_id'] == 'legacy' and run['seed'] is None
+    assert run['fixture_sha256'] == digest({
+        'initial_users': SCENARIO_SPEC.initial_users(), 'events': get_canonical_events(SCENARIO_SPEC)})
+    assert run['scenario_sha256'] == manifest['contract']['sha256']
+    assert run['fixture_identifiers']['event_ids'] == list(SCENARIO_SPEC.event_ids)
+    assert run['executed_schedule_ids'] == run['passed_check_ids'] == list(range(1, 28))
+    assert run['failed_check_ids'] == run['not_evaluated_check_ids'] == []
+    assert manifest['executed_schedule_count'] == run['executed_schedule_count'] == 27
+    assert manifest['additional_scenarios'] == {
+        'evaluated': False, 'requested_seeds': [], 'runs': [], 'not_evaluated_seeds': [],
+        'status': 'not_evaluated', 'all_passed': None,
+    }
+    assert manifest['mutation_controls'] == {
+        'status': 'not_evaluated', 'scope': 'regression_only_not_acceptance'}
+
+
+@pytest.mark.parametrize('provenance', ['live_model_response', 'cached_fallback'])
+def test_manifest_uses_actual_cegis_provenance(monkeypatch, reports, provenance):
+    from chaoshook_engine.runner import export_verification_manifest
+
+    source, verification = _manifest_inputs(reports['patched'])
+    client, calls = _fake_wonder(monkeypatch, [source])
+    client.force_cache = provenance == 'cached_fallback'
+    _extract_patch(client, reports['vulnerable'])
+    assert len(calls) == (1 if provenance == 'live_model_response' else 0)
+    manifest = export_verification_manifest(source, verification, candidate_audit=client.model_routing)
+    assert manifest['candidate']['provenance'] == provenance
+    assert manifest['candidate']['provenance_basis'] == 'supplied_hash_bound_audit'
+
+
+@pytest.mark.parametrize('changed', ['source', 'contract', 'provenance'])
+def test_manifest_rejects_stale_or_unknown_provenance(reports, changed):
+    from chaoshook_engine.runner import export_verification_manifest
+
+    source, verification = _manifest_inputs(reports['patched'])
+    audit = {'candidate_sha256': verification['candidate_sha256'],
+             'contract_sha256': export_verification_manifest(source, verification)['contract']['sha256'],
+             'provenance': 'cached_fallback'}
+    audit[{'source': 'candidate_sha256', 'contract': 'contract_sha256', 'provenance': 'provenance'}[changed]] = 'stale'
+    with pytest.raises(ValueError, match='audit must match'):
+        export_verification_manifest(source, verification, candidate_audit=audit)
+
+
+def test_manifest_rejects_results_from_another_candidate(reports):
+    from chaoshook_engine.runner import export_verification_manifest
+
+    source, verification = _manifest_inputs(reports['patched'])
+    with pytest.raises(ValueError, match='Verification source hash'):
+        export_verification_manifest(source + '\n', verification)
+    with pytest.raises(ValueError, match='Evaluation source hash'):
+        export_verification_manifest(source, verification, evaluations=[{'candidate_sha256': 'stale'}])
+
+
+def test_manifest_real_failure_reporting_and_mutation_separation(reports):
+    from chaoshook_engine.runner import export_verification_manifest
+
+    source, verification = _manifest_inputs(reports['vulnerable'], Path(v1_vulnerable.__file__).read_text())
+    # Regression controls are deliberately outside runtime acceptance.
+    verification['mutation_controls'] = {'all_passed': True}
+    manifest = export_verification_manifest(source, verification)
+    run = manifest['runtime_acceptance']['run']
+    assert not manifest['runtime_acceptance']['accepted']
+    assert len(run['passed_check_ids']) == 6 and len(run['failed_check_ids']) == 21
+    assert run['failed_check_ids'] == [c['id'] for c in reports['vulnerable']['cells'] if not c['passed']]
+    assert run['business_property_violations']
+    assert {v['property'] for v in run['business_property_violations']} >= {'user.credit_balance', 'outbox_emails_count'}
+    assert run['execution_errors'] == [{'check_id': 25, 'code': 'handler_execution_error', 'count': 1}]
+    assert run['synchronization_errors'] == []
+    assert manifest['mutation_controls']['status'] == 'not_evaluated'
+
+
+def test_manifest_redacts_untrusted_evidence_and_preserves_error_categories(reports, monkeypatch):
+    from copy import deepcopy
+    from chaoshook_engine.runner import export_verification_manifest
+
+    secret = 'never-export-this-environment-value'
+    monkeypatch.setenv('MUSE_API_KEY', secret)
+    monkeypatch.setenv('PRIVATE_PROMPT', secret)
+    report = deepcopy(reports['patched'])
+    cell = report['cells'][0]
+    cell.update(passed=False, sql_trace=[secret], failure_reason=secret,
+                actual_state={'key': secret}, sequence=[secret], category=secret)
+    cell['property_violations'] = [
+        {'field': secret, 'actual': secret, 'expected': secret},
+        {'field': 'user.credit_balance', 'actual': secret, 'expected': secret},
+        {'field': 'execution.errors', 'actual': [
+            'Authorization: Bearer ' + secret,
+            'Both workers did not reach the idempotency SQL barrier',
+            'RuntimeError: SQL barrier requires two RaceWorker threads',
+            'Expected mid-handler crash was not injected',
+        ]},
+    ]
+    source, verification = _manifest_inputs(report, '# ' + secret)
+    verification['import_error'] = secret
+    verification['verification_error'] = secret
+    audit = {'candidate_sha256': verification['candidate_sha256'], 'provenance': 'cached_fallback',
+             'contract_sha256': export_verification_manifest(source, verification)['contract']['sha256'],
+             'prompt': secret, 'authorization': secret, 'model_identifier': secret}
+    manifest = export_verification_manifest(source, verification, candidate_audit=audit)
+    encoded = json.dumps(manifest)
+    assert secret not in encoded and 'Authorization' not in encoded and 'Bearer' not in encoded
+    run = manifest['runtime_acceptance']['run']
+    assert run['execution_errors'] == [{'check_id': 1, 'code': 'handler_execution_error', 'count': 1}]
+    assert {e['code'] for e in run['synchronization_errors']} == {
+        'barrier_not_reached', 'barrier_broken', 'crash_not_injected'}
+    assert run['import_error'] == 'candidate_import_error' and run['verification_error'] == 'verification_error'
+    assert {v['property'] for v in run['business_property_violations']} == {
+        'unrecognized_business_property', 'user.credit_balance'}
+
+
+def test_manifest_never_invents_unexecuted_results(reports):
+    from copy import deepcopy
+    from chaoshook_engine.runner import export_verification_manifest
+
+    report = deepcopy(reports['patched'])
+    report['cells'] = report['cells'][:2]  # Summary still claims 27; cells are authoritative.
+    source, verification = _manifest_inputs(report)
+    manifest = export_verification_manifest(source, verification, requested_seeds=[101])
+    assert not manifest['runtime_acceptance']['accepted']
+    run = manifest['runtime_acceptance']['run']
+    assert run['executed_schedule_ids'] == run['passed_check_ids'] == [1, 2]
+    assert run['not_evaluated_check_ids'] == list(range(3, 28))
+    assert manifest['executed_schedule_count'] == 2
+    assert manifest['additional_scenarios']['not_evaluated_seeds'] == [101]
+    assert manifest['additional_scenarios']['all_passed'] is None
+
+
+@pytest.mark.parametrize('handler, expected_exit, accepted', [
+    ('v2_patched.py', 0, True), ('v1_vulnerable.py', 1, False),
+])
+def test_cli_manifest_reproducibility_and_real_seeded_results(tmp_path, handler, expected_exit, accepted):
+    from hashlib import sha256
+
+    source = Path(v2_patched.__file__).with_name(handler)
+    manifest_path = tmp_path / 'evidence.json'
+    command = [sys.executable, '-m', 'chaoshook_engine.cli', 'export-pytest',
+               '--out', str(tmp_path / 'test_webhook_invariance.py'), '--manifest', str(manifest_path),
+               '--source', str(source), '--seed', '101', '--seed', '202']
+    contents = []
+    for _ in range(2):
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        assert result.returncode == expected_exit, result.stdout + result.stderr
+        contents.append(manifest_path.read_bytes())
+    assert contents[0] == contents[1]
+    manifest = json.loads(contents[0])
+    assert manifest['candidate']['source_sha256'] == sha256(source.read_bytes()).hexdigest()
+    assert manifest['runtime_acceptance']['accepted'] is accepted
+    assert manifest['executed_schedule_count'] == 81
+    additional = manifest['additional_scenarios']
+    assert additional['status'] == 'completed' and additional['evaluated']
+    assert additional['all_passed'] is accepted and additional['not_evaluated_seeds'] == []
+    assert [r['seed'] for r in additional['runs']] == [101, 202]
+    for run in additional['runs']:
+        assert run['label'] == 'evaluation'  # Export never invents held-out history.
+        assert run['executed_schedule_ids'] == list(range(1, 28))
+        assert run['executed_schedule_count'] == 27
+        assert bool(run['failed_check_ids']) is not accepted
+
+
+def test_cli_manifest_import_failure_reports_no_executed_checks(tmp_path, capsys):
+    from hashlib import sha256
+    from chaoshook_engine.cli import main
+
+    source = tmp_path / 'candidate.py'
+    # Preserve CRLF bytes and prove hashing does not normalize them.
+    source.write_bytes(b'def process_stripe_webhook(*args): pass\r\nraise ImportError("private-token")\r\n')
+    manifest_path = tmp_path / 'evidence.json'
+    assert main(['export-pytest', '--out', str(tmp_path / 'test_export.py'), '--manifest', str(manifest_path),
+                 '--source', str(source), '--seed', '404']) == 1
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest['candidate']['source_sha256'] == sha256(source.read_bytes()).hexdigest()
+    assert manifest['executed_schedule_count'] == 0
+    assert not manifest['runtime_acceptance']['accepted']
+    runs = [manifest['runtime_acceptance']['run'], *manifest['additional_scenarios']['runs']]
+    for run in runs:
+        assert run['executed_schedule_ids'] == run['passed_check_ids'] == run['failed_check_ids'] == []
+        assert run['not_evaluated_check_ids'] == list(range(1, 28))
+        assert run['import_error'] == 'candidate_import_error'
+    assert manifest['additional_scenarios']['status'] == 'not_evaluated'
+    assert manifest['additional_scenarios']['not_evaluated_seeds'] == [404]
+    assert manifest['additional_scenarios']['all_passed'] is None
+    assert 'private-token' not in manifest_path.read_text() + capsys.readouterr().out
+
+
+def test_cli_manifest_verifier_failure_is_not_a_pass(tmp_path, monkeypatch):
+    from chaoshook_engine import patcher
+    from chaoshook_engine.cli import main
+
+    def broken(*args, **kwargs):
+        raise RuntimeError('private-verifier-message')
+
+    monkeypatch.setattr(patcher, 'verify_candidate_patch', broken)
+    monkeypatch.setattr(patcher, 'evaluate_candidate_patch', broken)
+    path = tmp_path / 'evidence.json'
+    assert main(['export-pytest', '--out', str(tmp_path / 'test_export.py'), '--manifest', str(path),
+                 '--source', v2_patched.__file__, '--seed', '101']) == 1
+    manifest = json.loads(path.read_text())
+    assert manifest['executed_schedule_count'] == 0
+    assert manifest['runtime_acceptance']['run']['verification_error'] == 'verification_error'
+    assert manifest['additional_scenarios']['runs'][0]['verification_error'] == 'verification_error'
+    assert manifest['additional_scenarios']['all_passed'] is None
+    assert 'private-verifier-message' not in path.read_text()
+
+
+def test_cli_manifest_keeps_failed_evaluation_separate_from_acceptance(tmp_path, monkeypatch):
+    from chaoshook_engine import cli
+
+    def no_muse(*args, **kwargs):
+        pytest.fail('manifest export must never instantiate a Muse client')
+
+    monkeypatch.setattr(cli, 'MuseNeuroSymbolicClient', no_muse)
+    source = tmp_path / 'candidate.py'
+    source.write_text(Path(v2_patched.__file__).read_text() + '''
+_original_handler = process_stripe_webhook
+def process_stripe_webhook(session, raw_body, signature):
+    import json
+    if json.loads(raw_body)['data']['object']['customer'] != 'cus_nova_99':
+        raise ValueError('additional fixture rejected')
+    return _original_handler(session, raw_body, signature)
+''')
+    path = tmp_path / 'evidence.json'
+    assert cli.main(['export-pytest', '--out', str(tmp_path / 'test_export.py'), '--manifest', str(path),
+                     '--source', str(source), '--seed', '101']) == 1
+    manifest = json.loads(path.read_text())
+    assert manifest['runtime_acceptance']['accepted']  # Legacy criterion stays 27/27.
+    assert manifest['additional_scenarios']['all_passed'] is False
+    assert manifest['executed_schedule_count'] == 54
+    run = manifest['additional_scenarios']['runs'][0]
+    assert run['failed_check_ids'] == list(range(1, 28))
+    assert run['execution_errors'] and run['synchronization_errors']
+
+
+def test_cli_manifest_audit_is_hash_bound_before_execution(tmp_path, monkeypatch, reports):
+    from chaoshook_engine import cli, patcher
+    from chaoshook_engine.runner import export_verification_manifest
+
+    source, verification = _manifest_inputs(reports['patched'])
+    audit_path, manifest_path = tmp_path / 'audit.json', tmp_path / 'manifest.json'
+    audit = {'candidate_sha256': verification['candidate_sha256'], 'provenance': 'cached_fallback',
+             'contract_sha256': export_verification_manifest(source, verification)['contract']['sha256']}
+    audit_path.write_text(json.dumps(audit))
+    command = ['export-pytest', '--out', str(tmp_path / 'test_export.py'), '--manifest', str(manifest_path),
+               '--source', v2_patched.__file__, '--candidate-audit', str(audit_path)]
+    assert cli.main(command) == 0
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest['candidate']['provenance'] == 'cached_fallback'
+    assert manifest['additional_scenarios']['status'] == 'not_evaluated'
+    before = manifest_path.read_bytes()
+    audit['candidate_sha256'] = 'stale'
+    audit_path.write_text(json.dumps(audit))
+
+    def unexpected_execution(*args, **kwargs):
+        pytest.fail('reject stale provenance before execution')
+
+    monkeypatch.setattr(patcher, 'verify_candidate_patch', unexpected_execution)
+    with pytest.raises(SystemExit) as caught:
+        cli.main(command)
+    assert caught.value.code == 2 and manifest_path.read_bytes() == before

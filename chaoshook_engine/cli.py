@@ -3,6 +3,7 @@
 import argparse
 import difflib
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -10,7 +11,9 @@ from time import perf_counter
 
 from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
 from chaoshook_engine.patcher import HANDLER_DIR
-from chaoshook_engine.runner import export_pytest_code, run_algebraic_prover
+from chaoshook_engine.runner import (
+    candidate_export_provenance, export_pytest_code, export_verification_manifest, run_algebraic_prover,
+)
 from target_app.handlers import v1_vulnerable, v2_patched
 
 
@@ -111,6 +114,14 @@ def main(argv=None) -> int:
     commands.add_parser("live-patch-check", help="Prove a live Wonder patch without installing it")
     export = commands.add_parser("export-pytest", help="Export the 27-cell pytest regression suite")
     export.add_argument("--out", type=Path, default=Path("test_webhook_invariance.py"))
+    export.add_argument("--manifest", type=Path,
+                        help="Also execute candidate verification and write reproducible JSON evidence (no Muse)")
+    export.add_argument("--source", type=Path,
+                        help="Candidate for manifest verification (default: active_handler.py)")
+    export.add_argument("--seed", type=int, action="append", dest="seeds",
+                        help="Explicit additional evaluation seed; omit to record not evaluated")
+    export.add_argument("--candidate-audit", type=Path,
+                        help="Existing candidate audit record or model_routing JSON; hashes must match source/contract")
     evaluate = commands.add_parser("evaluate", help="Evaluate source on seeded scenarios, without Muse")
     evaluate.add_argument("--source", type=Path, required=True)
     evaluate.add_argument("--seed", type=int, action="append", dest="seeds")
@@ -118,7 +129,6 @@ def main(argv=None) -> int:
                           help="JSON history with used_seeds and retired_seeds; updated before returning")
     args = parser.parse_args(argv)
     if args.command == "evaluate":
-        import json
         from chaoshook_engine.patcher import EvaluationHistory, evaluate_candidate_patch
 
         history = None
@@ -139,8 +149,61 @@ def main(argv=None) -> int:
         print(json.dumps(result, indent=2))
         return 0 if result["all_passed"] else 1
     if args.command == "export-pytest":
+        if not args.manifest and (args.source or args.seeds or args.candidate_audit):
+            parser.error("--source, --seed, and --candidate-audit require --manifest")
+        if args.manifest:
+            from dataclasses import asdict
+            from hashlib import sha256
+            from chaoshook_engine.fixtures import scenario_from_seed
+            from chaoshook_engine.patcher import evaluate_candidate_patch, verify_candidate_patch
+
+            source_path = args.source or HANDLER_DIR / "active_handler.py"
+            # Hash and execute the same frozen UTF-8 bytes, including original newlines.
+            source = source_path.read_bytes().decode("utf-8")
+            seeds = args.seeds or []
+            if len(set(seeds)) != len(seeds):
+                parser.error("Evaluation seeds must be distinct")
+            # Reject path collisions before either artifact can overwrite an input.
+            inputs = [source_path, *([args.candidate_audit] if args.candidate_audit else [])]
+            if (args.out.resolve() == args.manifest.resolve()
+                    or any(output.resolve() == path.resolve()
+                           for output in (args.out, args.manifest) for path in inputs)):
+                parser.error("Export output paths must be distinct from each other and input paths")
+            audit = (json.loads(args.candidate_audit.read_text(encoding="utf-8"))
+                     if args.candidate_audit else None)
+            try:
+                candidate_export_provenance(source, audit)
+            except ValueError as exc:
+                parser.error(str(exc))
+            source_hash = sha256(source.encode("utf-8")).hexdigest()
+            try:
+                verification = verify_candidate_patch(source)
+            except Exception:
+                # A fatal verifier exception returns no completed report. Do not
+                # manufacture results for any schedules it may have started.
+                verification = {"candidate_sha256": source_hash, "verification_error": True}
+            evaluations = []
+            for seed in seeds:
+                try:
+                    evaluation = evaluate_candidate_patch(source, [seed])
+                except Exception:
+                    evaluation = {"candidate_sha256": source_hash, "verification_error": True, "evaluations": []}
+                if not evaluation["evaluations"]:
+                    evaluation["evaluations"] = [{
+                        "seed": seed, "scenario": asdict(scenario_from_seed(seed)), "label": "evaluation",
+                        "prover_report": None, "import_error": evaluation.get("import_error"),
+                        "verification_error": evaluation.get("verification_error"),
+                    }]
+                evaluations.append(evaluation)
+            manifest = export_verification_manifest(source, verification, evaluations=evaluations,
+                                                    requested_seeds=seeds, candidate_audit=audit)
+            args.manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         args.out.write_text(export_pytest_code(), encoding="utf-8")
         print(f"Exported pytest suite to {args.out}")
+        if args.manifest:
+            print(f"Exported verification manifest to {args.manifest}")
+            return 0 if (manifest["runtime_acceptance"]["accepted"] and
+                         (not seeds or manifest["additional_scenarios"]["all_passed"] is True)) else 1
         return 0
     if args.command == "ping-muse":
         return ping_muse()
