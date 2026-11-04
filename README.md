@@ -126,22 +126,73 @@ A failing edited handler is labeled **CUSTOM EDIT (n/27)** in amber, and resetti
 
 ## Quickstart
 
-Requires Python 3.11+ and Node.js/npm compatible with Vite 6.
-Everything runs locally with Python, SQLite, and Vite; Docker and external database services are unnecessary.
+The validated Ubuntu Linux environment is **Ubuntu 24.04, Python 3.12.3,
+Node 22.23.4, npm 10.9.9**. Python 3.11 is the code's minimum; other Python
+versions have not been exercised here. Use Python 3.12 for reproduction. The
+frontend declares Node `>=22.20 <23` and npm `>=10 <11`, matching the validated
+major versions and the locked native dependency requirements. No Docker or
+external database service is required.
 
-From the repository root:
+On a fresh WSL Ubuntu 24.04 shell, install OS prerequisites:
+
+```bash
+sudo apt update
+sudo apt install python3 python3-venv python3-pip git
+```
+
+Install Node 22.23.4 with npm 10 using your existing Node version manager (for
+example, `nvm install 22.23.4` then `nvm use 22.23.4`). Ubuntu's default Node
+package may not match the required version. Use Linux Node/npm inside WSL, and
+keep the checkout under `~/projects`, rather than a Windows-mounted directory,
+for SQLite locking and filesystem performance. Clone the repository, enter its
+root, then run:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+python -m pip install -r requirements.txt
+python -m pip check
+python -m chaoshook_engine.cli preflight
 ```
 
-For a network-independent demo, set `DEMO_FALLBACK_CACHE=true` in your local `.env`; no model credential is required for Instant mode or deterministic scenario verification.
-For live analysis, configure `MUSE_API_KEY` privately as described in `.env.example`, set `MUSE_BASE_URL` to your compatible service endpoint, and set `DEMO_FALLBACK_CACHE=false`.
-The example selects `muse-wonder-1.0`, `muse-spark-1.3`, and a 180-second request timeout.
-The client loads local `.env` settings without overriding existing process environment variables. Keep credentials out of commits and shared output.
+The preflight exits nonzero for missing/import-broken Python dependencies,
+unsupported Node/npm, missing git, or unwritable temporary storage. It works
+before third-party dependencies are installed. It reports only configuration
+presence, never values, and performs no network requests. It probes both the
+configured temporary directory and `/tmp`, used by candidate verification.
+It does not prove API connectivity, port availability, or production DB semantics.
+
+Python direct dependencies and Starlette's API/TestClient integration are pinned
+to the locally validated versions in `requirements.txt`. Transitive Python
+requirements still resolve at install time: this is not a complete hash-locked
+Python environment. Run `pip check` after installation; package index access and
+compatible wheels are required on first install. The frontend's committed v3
+lockfile includes exact transitive versions and integrity hashes. Use `npm ci`,
+which checks consistency and avoids re-resolving versions; do not regenerate the
+lockfile as part of setup. The existing Vite React plugin remains in place.
+
+### Offline demo setup
+
+No `.env` or API credential is required for `verify`, `evaluate`, `qualify`, or
+`demo`. For the dashboard's deterministic cached analysis, run
+`export DEMO_FALLBACK_CACHE=true` before starting the backend, or copy
+`.env.example` to `.env` and set that flag to `true`. Cached output uses the
+prepared reference, not live generation. Installing dependencies initially
+requires network access or previously downloaded packages; offline operation
+refers to the installed demo.
+
+### Optional live Muse setup
+
+Copy `.env.example` to `.env` without overwriting an existing private file, then
+supply your API key and provider-confirmed compatible base URL/model IDs. The
+example URL is a configuration example, not a verified available endpoint. Set
+`DEMO_FALLBACK_CACHE=false` to enable live analysis. Run
+`python -m chaoshook_engine.cli preflight --live` to check presence only; this
+does not contact the service or validate credentials. The example selects
+`muse-wonder-1.0`, `muse-spark-1.3`, and a 180-second timeout. Request failures fall
+back to cached analysis. Live diagnosis incurs provider costs. The client loads
+`.env` without overriding process environment values. `.env` is gitignored;
+never commit credentials or paste them into evidence exports.
 
 Start the backend:
 
@@ -154,7 +205,7 @@ In another terminal, start the UI:
 
 ```bash
 cd ui
-npm install
+npm ci --no-audit --no-fund
 npm run dev
 ```
 
@@ -168,6 +219,23 @@ pytest -q tests/test_gate.py
 python -m chaoshook_engine.cli export-pytest --out test_webhook_invariance.py
 pytest -q test_webhook_invariance.py
 ```
+
+The verification command must print vulnerable **6/27** and patched **27/27**,
+with both gates passing: the vulnerable score is an expected demonstration result.
+Neither command installs the repaired handler. Additional seeded evaluation and
+mutation controls are separate from runtime acceptance:
+
+```bash
+python -m chaoshook_engine.cli evaluate --source target_app/handlers/v2_patched.py --seed 101 --seed 202 --seed 303
+python -m chaoshook_engine.cli qualify --source target_app/handlers/v2_patched.py --seed 101 --seed 202 --manifest /tmp/qualification.json
+python -m pytest -q tests/test_gate.py -k mutation
+python -m pytest -q -s tests/test_gate.py -k mutation_summary
+```
+
+The last command prints the temporary mutation-summary JSON path. These are known
+regression seeds, not unseen held-out evidence. See the qualification and demo
+sections below for manifest semantics. To check the frontend build, run
+`npm run build` from `ui/` after `npm ci`.
 
 The exported suite imports the active handler and runs the prover once through a module-scoped fixture, producing 24 permutation tests, one barrier test, and two crash-retry tests.
 It deliberately fails against the vulnerable baseline; all 27 tests pass when the active handler is verified.
@@ -258,6 +326,80 @@ Errors retain counts and fixed codes (`handler_execution_error`,
 `barrier_not_reached`, `barrier_broken`, `crash_not_injected`,
 `candidate_import_error`, `verification_error`). Consult the local report/UI for
 detailed values and traces; the portable manifest deliberately omits them.
+
+### Optional post-repair qualification
+
+Qualify a frozen candidate separately from repair acceptance:
+
+```bash
+.venv/bin/python -m chaoshook_engine.cli qualify \
+  --source target_app/handlers/v2_patched.py --seed 101 --seed 202 \
+  --manifest /tmp/qualification.json
+```
+
+`qualify_candidate_patch(source, seeds, contract=SCENARIO_SPEC, candidate_audit=None)`
+rechecks the original 27-cell gate before executing additional seeded scenarios.
+Seeds must be explicit, nonempty, distinct integers. The optional contract argument
+must equal the existing frozen contract; it cannot redefine the expected outcomes.
+The same exact UTF-8 source hash is checked for the base result and every seeded
+evaluation. Execution proceeds in sorted seed order, retaining earlier completed
+results if another seed errors. `--candidate-audit` accepts the same existing
+hash-bound provenance records described above. This command never installs code,
+calls Muse, or changes synthesis, cache fallback, or acceptance behavior.
+
+The returned result is the existing schema-v1 manifest with one optional additive
+`qualification` object. All previous fields retain their meanings. Candidate and
+contract hashes remain at `candidate.source_sha256` and `contract.sha256`; exact
+seeds, coverage, failures, and redacted violations remain in `additional_scenarios`.
+The qualification object uses the label **additional seeded qualification**.
+It makes no claim that regression seeds 101/202/303 are unseen or independently
+reserved. Individual run labels remain `evaluation` for compatibility.
+
+- `base_verification_status`: `passed`, `failed`, or `incomplete_or_errored`.
+- `status`: `passed` only after base verification and every requested seed
+  complete all 27 schedules and pass; `failed` when all requested scenarios
+  complete but any check fails; `incomplete_or_errored` when seeded evidence is
+  missing, partial, invalid, or an evaluator raises; `not_evaluated` when the base
+  gate fails or cannot complete, with `not_evaluated_reason` identifying why.
+- `qualified`: true only for `status: passed`. `completed_seeds` includes fully
+  executed failing scenarios too. `errors` contains only fixed error codes.
+
+Completed handler/synchronization check failures produce `failed`; fatal
+evaluator exceptions with no returned report produce `incomplete_or_errored`.
+An incomplete run takes precedence over a completed failure in the overall
+status; individual failures remain visible. A base pass is preserved even when
+qualification fails. CLI exit code is 0 only when qualified, 1 otherwise; invalid
+arguments use 2. JSON is printed to stdout and, with `--manifest`, saved identically
+even when qualification fails. Without a `qualification` object, an older/export
+manifest makes no qualification claim. Mutation controls remain separate.
+The existing finite-scenario, redaction, interrupted-report, and replay limitations
+apply; passing these known seeds is bounded evidence, not universal correctness.
+
+### Single-command offline evidence demo
+
+```bash
+.venv/bin/python -m chaoshook_engine.cli demo --out /tmp/chaoshook-demo
+```
+
+This reuses qualification and schema-v1 exports: the vulnerable baseline must
+reproduce 6/27 base passes, and the **prepared reference repair** must pass 27/27
+plus additional seeded qualification. Default seeds are 101, 202, 303; override
+with repeated `--seed` arguments. The baseline's failed base gate skips its
+additional qualification. No live models, installation, or active-handler edits
+occur. Acceptance rules and all existing commands remain unchanged.
+
+Outputs are `vulnerable.json`, `repaired.json` (including every completed seeded
+scenario), `demo.json` (outcomes, hashes, seeds, counts, and exact replay argument
+lists), and `summary.md`. Replay commands assume the output directory as the
+working directory and the project packages on `PYTHONPATH`; the baseline replay
+returns 1 because its failures are expected. The demo returns 0 only when all
+expected results are reproduced; execution errors or unexpected outcomes return
+nonzero. Returned errors are redacted; unavailable reports count as zero executed
+checks. Files with these names are replaced on reruns. No timestamps, durations,
+or output-directory paths enter the evidence, so identical source, project path,
+contract, seeds, and outcomes produce identical files. Keep the source checkout
+to replay; these known finite scenarios are not unseen held-out evidence or a
+general correctness proof.
 
 Optional live checks, which make billable network requests:
 

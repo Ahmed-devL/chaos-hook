@@ -1828,3 +1828,294 @@ def test_cli_manifest_audit_is_hash_bound_before_execution(tmp_path, monkeypatch
     with pytest.raises(SystemExit) as caught:
         cli.main(command)
     assert caught.value.code == 2 and manifest_path.read_bytes() == before
+
+
+def test_qualification_valid_candidate_uses_frozen_source_and_contract(monkeypatch):
+    from dataclasses import asdict
+    from hashlib import sha256
+    from chaoshook_engine import patcher, cli
+
+    source = Path(v2_patched.__file__).read_text()
+    active = patcher.HANDLER_DIR / 'active_handler.py'
+    before = active.read_bytes()
+    calls = []
+    original = patcher.evaluate_candidate_patch
+
+    def evaluate(code, seeds):
+        calls.append((sha256(code.encode()).hexdigest(), tuple(seeds)))
+        return original(code, seeds)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('qualification must not install, reset, or use Muse')
+
+    monkeypatch.setattr(patcher, 'evaluate_candidate_patch', evaluate)
+    monkeypatch.setattr(patcher, 'apply_patch_to_active', unexpected)
+    monkeypatch.setattr(patcher, 'reset_active_to_vulnerable', unexpected)
+    monkeypatch.setattr(cli, 'MuseNeuroSymbolicClient', unexpected)
+    manifest = patcher.qualify_candidate_patch(source, [202, 101], contract=SCENARIO_SPEC)
+    assert manifest['schema_version'] == 1
+    assert manifest['contract']['sha256'] == sha256(json.dumps(asdict(SCENARIO_SPEC), sort_keys=True).encode()).hexdigest()
+    assert calls == [(manifest['candidate']['source_sha256'], (seed,)) for seed in (101, 202)]
+    assert manifest['qualification'] == {
+        'label': 'additional seeded qualification', 'base_verification_status': 'passed',
+        'status': 'passed', 'qualified': True, 'completed_seeds': [101, 202],
+        'not_evaluated_reason': None, 'errors': [],
+    }
+    assert manifest['runtime_acceptance']['accepted']
+    assert manifest['executed_schedule_count'] == 81
+    for run in manifest['additional_scenarios']['runs']:
+        assert run['label'] == 'evaluation' and run['seed'] in (101, 202)
+        assert run['executed_schedule_ids'] == run['passed_check_ids'] == list(range(1, 28))
+        assert not run['business_property_violations']
+    assert manifest['mutation_controls']['scope'] == 'regression_only_not_acceptance'
+    assert active.read_bytes() == before
+
+
+@pytest.mark.parametrize('source', ['v1_vulnerable.py', 'v1_partial_idempotent.py'])
+def test_qualification_skips_additional_scenarios_when_base_fails(monkeypatch, source):
+    from chaoshook_engine import patcher
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('additional qualification requires base verification to pass')
+
+    monkeypatch.setattr(patcher, 'evaluate_candidate_patch', unexpected)
+    manifest = patcher.qualify_candidate_patch(Path(v2_patched.__file__).with_name(source).read_text(), [101])
+    assert not manifest['runtime_acceptance']['accepted']
+    assert manifest['qualification']['base_verification_status'] == 'failed'
+    assert manifest['qualification']['status'] == 'not_evaluated'
+    assert not manifest['qualification']['qualified']
+    assert manifest['qualification']['not_evaluated_reason'] == 'base_verification_failed'
+    assert manifest['additional_scenarios']['not_evaluated_seeds'] == [101]
+    assert manifest['additional_scenarios']['all_passed'] is None
+
+
+@pytest.mark.parametrize('failure', ['partial_report', 'exception', 'hash_mismatch', 'import_error'])
+def test_qualification_incomplete_or_errored_never_passes(monkeypatch, reports, failure):
+    from dataclasses import asdict
+    from copy import deepcopy
+    from chaoshook_engine import patcher
+    from chaoshook_engine.fixtures import scenario_from_seed
+
+    source, verification = _manifest_inputs(reports['patched'])
+    monkeypatch.setattr(patcher, 'verify_candidate_patch', lambda code: verification)
+    original = patcher.evaluate_candidate_patch
+
+    def evaluate(code, seeds):
+        if seeds == [101]:
+            return original(code, seeds)
+        if failure == 'exception':
+            raise RuntimeError('private-qualification-error')
+        if failure == 'hash_mismatch':
+            # Complete successful evidence for different source must be discarded.
+            result = original(code, seeds)
+            result['candidate_sha256'] = 'different-candidate'
+            return result
+        if failure == 'import_error':
+            return {'candidate_sha256': verification['candidate_sha256'], 'evaluations': [],
+                    'import_error': 'private-qualification-import-error'}
+        report = deepcopy(reports['patched'])
+        report['cells'] = report['cells'][:2]  # Totals falsely still claim 27.
+        return {'candidate_sha256': verification['candidate_sha256'], 'all_passed': True,
+                'evaluations': [{'seed': 202, 'label': 'evaluation',
+                                 'scenario': asdict(scenario_from_seed(202)), 'prover_report': report}]}
+
+    monkeypatch.setattr(patcher, 'evaluate_candidate_patch', evaluate)
+    manifest = patcher.qualify_candidate_patch(source, [101, 202])
+    assert manifest['runtime_acceptance']['accepted']
+    assert manifest['qualification']['base_verification_status'] == 'passed'
+    assert manifest['qualification']['status'] == 'incomplete_or_errored'
+    assert not manifest['qualification']['qualified']
+    assert manifest['qualification']['completed_seeds'] == [101]
+    assert manifest['additional_scenarios']['runs'][0]['passed_check_ids'] == list(range(1, 28))
+    assert manifest['additional_scenarios']['all_passed'] is None
+    if failure == 'hash_mismatch':
+        assert manifest['qualification']['errors'] == [
+            {'stage': 'additional_evaluation', 'seed': 202, 'code': 'candidate_hash_mismatch'}]
+        assert manifest['additional_scenarios']['runs'][1]['executed_schedule_ids'] == []
+    assert 'private-qualification' not in json.dumps(manifest)
+
+
+def test_qualification_rejects_base_source_hash_mismatch(monkeypatch, reports):
+    from chaoshook_engine import patcher
+
+    source, verification = _manifest_inputs(reports['patched'])
+    verification['candidate_sha256'] = 'another-source'
+    monkeypatch.setattr(patcher, 'verify_candidate_patch', lambda code: verification)
+    manifest = patcher.qualify_candidate_patch(source, [101])
+    assert not manifest['runtime_acceptance']['accepted']
+    assert manifest['executed_schedule_count'] == 0
+    assert manifest['qualification']['base_verification_status'] == 'incomplete_or_errored'
+    assert manifest['qualification']['status'] == 'not_evaluated'
+    assert manifest['qualification']['errors'][0]['code'] == 'candidate_hash_mismatch'
+
+
+@pytest.mark.parametrize('seeds', [[], [101, 101], [True], ['101']])
+def test_qualification_requires_explicit_valid_seeds(seeds):
+    from chaoshook_engine.patcher import qualify_candidate_patch
+
+    with pytest.raises(ValueError, match='explicit distinct integer seeds'):
+        qualify_candidate_patch('unused source', seeds)
+
+
+def test_qualification_cannot_redefine_the_frozen_contract():
+    from dataclasses import replace
+    from chaoshook_engine.patcher import qualify_candidate_patch
+
+    with pytest.raises(ValueError, match='existing frozen contract'):
+        qualify_candidate_patch('unused source', [101], contract=replace(SCENARIO_SPEC, initial_credit_balance=500))
+
+
+@pytest.mark.parametrize('candidate, expected_exit, status', [
+    ('valid', 0, 'passed'), ('overfit', 1, 'failed'), ('vulnerable', 1, 'not_evaluated'),
+])
+def test_qualification_cli_manifest_status_and_reproducibility(tmp_path, candidate, expected_exit, status):
+    source = tmp_path / 'candidate.py'
+    source.write_text(Path(v1_vulnerable.__file__ if candidate == 'vulnerable' else v2_patched.__file__).read_text())
+    if candidate == 'overfit':
+        # Pass the base lifecycle but violate seeded credit conservation.
+        source.write_text(source.read_text() + '''
+_original_handler = process_stripe_webhook
+def process_stripe_webhook(session, raw_body, signature):
+    import json
+    from sqlalchemy import text
+    result = _original_handler(session, raw_body, signature)
+    event = json.loads(raw_body)
+    if event['data']['object']['customer'] != 'cus_nova_99':
+        session.execute(text('UPDATE users SET credit_balance = 0'))
+        session.commit()
+    return result
+''')
+    path = tmp_path / 'qualification.json'
+    command = [sys.executable, '-m', 'chaoshook_engine.cli', 'qualify', '--source', str(source),
+               '--seed', '101', '--seed', '202', '--manifest', str(path)]
+    payloads = []
+    for _ in range(2):
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        assert result.returncode == expected_exit, result.stdout + result.stderr
+        assert result.stdout.encode() == path.read_bytes()
+        payloads.append(path.read_bytes())
+    assert payloads[0] == payloads[1]
+    manifest = json.loads(payloads[0])
+    assert manifest['qualification']['status'] == status
+    assert manifest['qualification']['qualified'] is (status == 'passed')
+    if candidate == 'overfit':
+        assert manifest['runtime_acceptance']['accepted']
+        assert manifest['qualification']['completed_seeds'] == [101, 202]
+        assert manifest['additional_scenarios']['all_passed'] is False
+        assert all(run['business_property_violations'] for run in manifest['additional_scenarios']['runs'])
+
+
+def test_qualification_cli_records_evaluation_error(tmp_path, monkeypatch, reports, capsys):
+    from chaoshook_engine import cli, patcher
+
+    source, verification = _manifest_inputs(reports['patched'])
+    monkeypatch.setattr(patcher, 'verify_candidate_patch', lambda code: verification)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError('private-qualification-exception')
+
+    monkeypatch.setattr(patcher, 'evaluate_candidate_patch', broken)
+    path = tmp_path / 'qualification.json'
+    assert cli.main(['qualify', '--source', v2_patched.__file__, '--seed', '101', '--manifest', str(path)]) == 1
+    payload = capsys.readouterr().out
+    assert payload == path.read_text() and 'private-qualification-exception' not in payload
+    manifest = json.loads(payload)
+    assert manifest['qualification']['base_verification_status'] == 'passed'
+    assert manifest['qualification']['status'] == 'incomplete_or_errored'
+    assert manifest['qualification']['errors'] == [
+        {'stage': 'additional_evaluation', 'seed': 101, 'code': 'evaluation_error'}]
+    assert manifest['additional_scenarios']['not_evaluated_seeds'] == [101]
+    assert manifest['additional_scenarios']['all_passed'] is None
+
+
+def test_offline_demo_smoke_and_reproducibility(tmp_path, monkeypatch):
+    from chaoshook_engine import cli, patcher
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('offline demo must not invoke Muse or install a handler')
+
+    monkeypatch.setattr(cli, 'MuseNeuroSymbolicClient', forbidden)
+    monkeypatch.setattr(patcher, 'apply_patch_to_active', forbidden)
+    monkeypatch.setattr(patcher, 'reset_active_to_vulnerable', forbidden)
+    active = patcher.HANDLER_DIR / 'active_handler.py'
+    before = active.read_bytes()
+    outputs = []
+    for name in ('first', 'second'):
+        folder = tmp_path / name
+        assert cli.main(['demo', '--out', str(folder), '--seed', '202', '--seed', '101']) == 0
+        outputs.append({path.name: path.read_bytes() for path in folder.iterdir()})
+    assert outputs[0] == outputs[1]
+    assert set(outputs[0]) == {'vulnerable.json', 'repaired.json', 'demo.json', 'summary.md'}
+    baseline = json.loads(outputs[0]['vulnerable.json'])
+    repair = json.loads(outputs[0]['repaired.json'])
+    index = json.loads(outputs[0]['demo.json'])
+    assert len(baseline['runtime_acceptance']['run']['failed_check_ids']) == 21
+    assert baseline['qualification']['status'] == 'not_evaluated'
+    assert baseline['executed_schedule_count'] == 27
+    assert repair['qualification']['qualified'] and repair['executed_schedule_count'] == 81
+    assert repair['candidate']['provenance'] == 'prepared'
+    assert index['expected_results_reproduced'] and index['seeds'] == [101, 202]
+    for record, manifest in zip(index['evaluations'], (baseline, repair)):
+        assert record['candidate_sha256'] == manifest['candidate']['source_sha256']
+        assert record['contract'] == manifest['contract']
+        assert record['replay_command'][3] == 'qualify'
+    assert b'prepared reference repair' in outputs[0]['summary.md']
+    assert active.read_bytes() == before
+
+
+@pytest.mark.parametrize('failure', ['unexpected_outcome', 'exception'])
+def test_offline_demo_failure_is_visible(tmp_path, monkeypatch, failure):
+    from chaoshook_engine import cli, patcher
+
+    original = patcher.qualify_candidate_patch
+
+    def broken(source, seeds):
+        if failure == 'exception':
+            raise RuntimeError('private-demo-error')
+        result = original(source, seeds)
+        result['runtime_acceptance']['run']['passed_check_ids'] = []
+        return result
+
+    monkeypatch.setattr(patcher, 'qualify_candidate_patch', broken)
+    assert cli.main(['demo', '--out', str(tmp_path), '--seed', '101']) == 1
+    index = json.loads((tmp_path / 'demo.json').read_text())
+    assert not index['expected_results_reproduced']
+    assert 'False' in (tmp_path / 'summary.md').read_text()
+    assert 'private-demo-error' not in ''.join(path.read_text() for path in tmp_path.iterdir())
+    if failure == 'exception':
+        assert all(record['executed_schedule_count'] == 0 for record in index['evaluations'])
+
+
+def test_offline_demo_cli_defaults(tmp_path):
+    result = subprocess.run([sys.executable, '-m', 'chaoshook_engine.cli', 'demo', '--out', str(tmp_path)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    index = json.loads((tmp_path / 'demo.json').read_text())
+    assert index['seeds'] == [101, 202, 303]
+    assert index['evaluations'][1]['executed_schedule_count'] == 108
+
+
+def test_preflight_is_safe_and_runs_without_site_packages():
+    result = subprocess.run([sys.executable, '-S', '-m', 'chaoshook_engine.cli', 'preflight'],
+                            capture_output=True, text=True, timeout=20,
+                            env={**os.environ, 'MUSE_API_KEY': 'preflight-private-value'})
+    assert result.returncode == 1
+    report = json.loads(result.stdout)
+    assert not report['ok'] and not report['checks']['fastapi']
+    assert report['configuration_present']['MUSE_API_KEY']
+    assert report['live_connectivity_tested'] is False
+    assert 'preflight-private-value' not in result.stdout + result.stderr
+
+
+def test_preflight_reports_missing_tools_and_temp_failure(monkeypatch, capsys):
+    from chaoshook_engine import cli
+
+    monkeypatch.setattr(shutil, 'which', lambda name: None)
+    def unwritable(*args, **kwargs):
+        raise PermissionError('private-filesystem-detail')
+    monkeypatch.setattr(cli.tempfile, 'TemporaryDirectory', unwritable)
+    assert cli.main(['preflight']) == 1
+    payload = capsys.readouterr().out
+    report = json.loads(payload)
+    assert not report['checks']['node'] and not report['checks']['runner_tmp_writable']
+    assert 'private-filesystem-detail' not in payload

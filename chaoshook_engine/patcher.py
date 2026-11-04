@@ -9,6 +9,8 @@ from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import RLock
 from uuid import uuid4
 
+from chaoshook_engine.scenario_spec import SCENARIO_SPEC
+
 
 HANDLER_DIR = Path(__file__).resolve().parents[1] / "target_app" / "handlers"
 _LOCK = RLock()
@@ -182,3 +184,89 @@ def evaluate_candidate_patch(code: str, seeds=(101, 202, 303), *, history=None) 
             return result
         finally:
             sys.modules.pop(name, None)
+
+
+def qualify_candidate_patch(code: str, seeds, *, contract=SCENARIO_SPEC, candidate_audit=None) -> dict:
+    """Opt-in post-repair qualification; return a redacted schema-v1 manifest.
+
+    Reverify base acceptance, then evaluate the frozen source on explicit seeds.
+    Never install, synthesize, change the contract, or infer held-out provenance.
+    Completed failing schedules are failures; missing reports are incomplete.
+    """
+    from dataclasses import asdict
+    from chaoshook_engine.fixtures import scenario_from_seed
+    from chaoshook_engine.runner import candidate_export_provenance, export_verification_manifest
+
+    seeds = tuple(seeds)
+    if not seeds or any(type(seed) is not int for seed in seeds) or len(set(seeds)) != len(seeds):
+        raise ValueError("Qualification requires explicit distinct integer seeds")
+    if type(contract) is not type(SCENARIO_SPEC) or contract != SCENARIO_SPEC:
+        raise ValueError("Qualification requires the existing frozen contract")
+    seeds = sorted(seeds)
+    candidate_export_provenance(code, candidate_audit)
+    source_hash = sha256(code.encode("utf-8")).hexdigest()
+    errors = []
+
+    def error_result(stage, seed, error_code):
+        errors.append({"stage": stage, "seed": seed, "code": error_code})
+        return {"candidate_sha256": source_hash, "verification_error": True}
+
+    try:
+        verification = verify_candidate_patch(code)
+    except Exception:
+        verification = error_result("base_verification", None, "verification_error")
+    if verification.get("candidate_sha256") != source_hash:
+        verification = error_result("base_verification", None, "candidate_hash_mismatch")
+    manifest = export_verification_manifest(code, verification, requested_seeds=seeds,
+                                            candidate_audit=candidate_audit)
+    evaluations = []
+    if manifest["runtime_acceptance"]["accepted"]:
+        for seed in seeds:
+            try:
+                evaluation = evaluate_candidate_patch(code, [seed])
+            except Exception:
+                evaluation = error_result("additional_evaluation", seed, "evaluation_error")
+            if evaluation.get("candidate_sha256") != source_hash:
+                evaluation = error_result("additional_evaluation", seed, "candidate_hash_mismatch")
+            if not evaluation.get("evaluations"):
+                evaluation["evaluations"] = [{
+                    "seed": seed, "scenario": asdict(scenario_from_seed(seed)), "label": "evaluation",
+                    "prover_report": None, "import_error": evaluation.get("import_error"),
+                    "verification_error": evaluation.get("verification_error"),
+                }]
+            # Validate before retaining a report; malformed evidence cannot erase
+            # earlier results or accidentally qualify the expected candidate.
+            try:
+                export_verification_manifest(code, verification, requested_seeds=[seed], evaluations=[evaluation])
+            except (ValueError, KeyError, TypeError):
+                evaluation = error_result("additional_evaluation", seed, "invalid_evaluation_evidence")
+                evaluation["evaluations"] = [{
+                    "seed": seed, "scenario": asdict(scenario_from_seed(seed)), "label": "evaluation",
+                    "prover_report": None, "verification_error": True,
+                }]
+            evaluations.append(evaluation)
+        manifest = export_verification_manifest(code, verification, requested_seeds=seeds,
+                                                evaluations=evaluations, candidate_audit=candidate_audit)
+
+    def completed(run):
+        return (run["executed_schedule_ids"] == list(range(1, 28))
+                and not run["import_error"] and not run["verification_error"])
+
+    base = manifest["runtime_acceptance"]
+    base_status = "passed" if base["accepted"] else "failed" if completed(base["run"]) else "incomplete_or_errored"
+    runs = manifest["additional_scenarios"]["runs"]
+    completed_seeds = [run["seed"] for run in runs if completed(run)]
+    if not base["accepted"]:
+        status = "not_evaluated"
+    elif completed_seeds != seeds:
+        status = "incomplete_or_errored"
+    else:
+        status = "failed" if any(run["failed_check_ids"] or run["business_property_violations"]
+                                 or run["execution_errors"] or run["synchronization_errors"] for run in runs) else "passed"
+    manifest["qualification"] = {
+        "label": "additional seeded qualification", "base_verification_status": base_status,
+        "status": status, "qualified": status == "passed", "completed_seeds": completed_seeds,
+        "not_evaluated_reason": f"base_verification_{base_status}" if not base["accepted"] else None,
+        "errors": errors,
+    }
+    return manifest

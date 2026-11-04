@@ -221,3 +221,6 @@ __marimo__/
 
 docs
 AGENTS.md
+
+# Frontend dependencies installed by npm ci
+ui/node_modules/
