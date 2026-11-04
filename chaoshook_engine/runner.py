@@ -16,10 +16,10 @@ from chaoshook_engine.interceptors import (
     CrashAfterStatementController, DualThreadBarrierController,
     SimulatedMidHandlerCrash,
 )
+from chaoshook_engine.scenario_spec import SCENARIO_SPEC
 from chaoshook_engine.snapshot import (
-    create_cell_engine, diff_states, extract_comparable_state, seed_initial_state,
+    create_cell_engine, extract_comparable_state, seed_initial_state,
 )
-from target_app.handlers.v2_patched import process_stripe_webhook as reference_handler
 from target_app.models import Base
 
 
@@ -151,41 +151,40 @@ def _failure_tag(category, sequence, differences, errors):
     return "STALE_PLAN_OVERWRITE"
 
 
-def _report_cell(engine, golden, cell_id, category, label, sequence, trace, errors):
+def _report_cell(engine, cell_id, category, label, sequence, trace, errors):
     with Session(engine) as session:
         actual = extract_comparable_state(session)
-    differences = diff_states(golden, actual)
+        violations = SCENARIO_SPEC.validate(session, actual, errors)
+    differences = [item for item in violations if item["field"] != "execution.errors"]
     reasons = [
         f"{item['field']}: expected {item['expected']!r}, got {item['actual']!r}"
         for item in differences
     ] + errors
     return {
         "id": cell_id, "category": category, "label": label,
-        "sequence": sequence, "passed": not differences and not errors,
+        "sequence": sequence, "passed": not violations,
         "failure_reason": "; ".join(reasons) if reasons else None,
         "failure_tag": _failure_tag(category, sequence, differences, errors),
         "actual_state": actual, "state_diff": differences, "sql_trace": trace,
+        "property_violations": violations,
     }
 
 
 def run_algebraic_prover(handler_fn) -> dict:
-    """Capture S* independently, then exercise every cell without sharing state."""
+    """Check the independent scenario contract across 27 isolated schedules."""
     started = perf_counter()
     payloads = get_canonical_events()
+    golden = SCENARIO_SPEC.expected_state()
     cells = []
     with TemporaryDirectory(prefix="chaoshook-") as folder, closing(sqlite3.connect(":memory:")) as seed:
         root = Path(folder)
-        engine = create_cell_engine(root / "golden.db")
-        with _cell(root / "golden.db", [], engine=engine) as engine:
+        engine = create_cell_engine(root / "seed.db")
+        with _cell(root / "seed.db", [], engine=engine) as engine:
             raw = engine.raw_connection()
             try:
                 raw.driver_connection.backup(seed)
             finally:
                 raw.close()
-            for payload in payloads:
-                _deliver(engine, reference_handler, payload, [])
-            with Session(engine) as session:
-                golden = extract_comparable_state(session)
 
         for cell_id, order in enumerate(permutations(range(4)), 1):
             trace, errors = [], []
@@ -194,7 +193,7 @@ def run_algebraic_prover(handler_fn) -> dict:
                 for index in order:
                     _safe_delivery(engine, handler_fn, payloads[index], trace, errors)
                 cells.append(_report_cell(
-                    engine, golden, cell_id, "permutation", " → ".join(sequence),
+                    engine, cell_id, "permutation", " → ".join(sequence),
                     sequence, trace, errors,
                 ))
 
@@ -220,7 +219,7 @@ def run_algebraic_prover(handler_fn) -> dict:
                 controller.close()
             _safe_delivery(engine, handler_fn, payloads[3], trace, errors)
             cells.append(_report_cell(
-                engine, golden, 25, "concurrency", "2-Thread SQL Barrier TOCTOU Race",
+                engine, 25, "concurrency", "2-Thread SQL Barrier TOCTOU Race",
                 ["e1", "e2", "e3 (RaceWorker-A)", "e3 (RaceWorker-B)", "e4"],
                 trace, errors,
             ))
@@ -256,7 +255,7 @@ def run_algebraic_prover(handler_fn) -> dict:
                 for payload in payloads[index + 1:]:
                     _safe_delivery(engine, handler_fn, payload, trace, errors)
                 cells.append(_report_cell(
-                    engine, golden, cell_id, "crash_retry", label, sequence, trace, errors,
+                    engine, cell_id, "crash_retry", label, sequence, trace, errors,
                 ))
 
     passed = sum(cell["passed"] for cell in cells)

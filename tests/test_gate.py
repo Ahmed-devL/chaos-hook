@@ -1,5 +1,8 @@
 """Behavioral gate for the 27-cell real-SQL prover and its report contract."""
 
+import builtins
+from dataclasses import FrozenInstanceError
+import importlib.util
 import json
 from itertools import permutations
 import os
@@ -14,6 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from chaoshook_engine.runner import run_algebraic_prover
+from chaoshook_engine.scenario_spec import SCENARIO_SPEC
 from target_app.handlers import v1_vulnerable, v2_patched
 
 
@@ -50,7 +54,9 @@ def test_patched_invariance(reports):
     for cell in report["cells"]:
         assert cell["passed"], cell["failure_reason"]
         assert cell["state_diff"] == []
+        assert cell["property_violations"] == []
         assert cell["actual_state"] == report["golden_state"]
+    assert report["golden_state"] == SCENARIO_SPEC.expected_state()
 
 
 def test_report_contract_and_fault_evidence(reports):
@@ -73,6 +79,7 @@ def test_report_contract_and_fault_evidence(reports):
             assert set(cell) == {
                 "id", "category", "label", "sequence", "passed", "failure_reason",
                 "failure_tag", "actual_state", "state_diff", "sql_trace",
+                "property_violations",
             }
             assert cell["sql_trace"]
             assert bool(cell["failure_tag"]) == (not cell["passed"])
@@ -84,6 +91,147 @@ def test_report_contract_and_fault_evidence(reports):
             assert trace.count("Attempt 1: injecting crash") == 1
             assert "Attempt 2: replay identical event" in trace
         json.dumps(report)
+
+
+def test_scenario_spec_is_frozen_and_expected_state_is_fresh():
+    with pytest.raises(FrozenInstanceError):
+        SCENARIO_SPEC.invoice_credit_delta = 0
+    expected = SCENARIO_SPEC.expected_state()
+    assert expected["user"]["credit_balance"] == SCENARIO_SPEC.initial_credit_balance + 100
+    expected["user"]["credit_balance"] = 0
+    assert SCENARIO_SPEC.expected_state()["user"]["credit_balance"] == 100
+
+
+def _consistent_handler_without_invoice_credit(session, raw_body, sig_header):
+    """Test-only negative control: convergent lifecycle, deliberately no credits."""
+    from sqlalchemy import text
+    from target_app.hmac_auth import verify_stripe_signature
+    from target_app.models import Subscription, User
+    from target_app.schemas import StripeEvent
+    from target_app.side_effects import send_welcome_email
+
+    if not verify_stripe_signature(raw_body, sig_header):
+        raise ValueError("Invalid Stripe signature")
+    event = StripeEvent.model_validate_json(raw_body)
+    obj = event.data.object
+    with session.begin():
+        claim = session.execute(text(
+            "INSERT INTO webhook_events (event_id, event_type, created_ts, status) "
+            "VALUES (:id, :type, :ts, 'processed') ON CONFLICT(event_id) DO NOTHING"
+        ), {"id": event.id, "type": event.type, "ts": event.created})
+        if claim.rowcount == 0:
+            return {"status": "duplicate"}
+        user = session.query(User).filter_by(stripe_customer_id=obj["customer"]).one()
+        if event.type == "invoice.paid":
+            # The intentional defect: claim delivery but omit both invoice effects.
+            return {"status": "processed"}
+        if event.type == "checkout.session.completed":
+            plan = "pro"
+            send_welcome_email(session, user.id, dedupe_key=event.id)
+            user.welcome_email_sent = 1
+        else:
+            deleted = event.type == "customer.subscription.deleted"
+            status = "canceled" if deleted else "active"
+            plan = "canceled" if deleted else "pro"
+            sub = session.get(Subscription, obj["id"])
+            if sub is None:
+                sub = Subscription(
+                    id=obj["id"], user_id=user.id, stripe_customer_id=obj["customer"],
+                    status=status, current_period_end=0, last_event_ts=0,
+                )
+                session.add(sub)
+            if event.created >= sub.last_event_ts:
+                sub.status = status
+                sub.last_event_ts = event.created
+            sub.current_period_end = max(sub.current_period_end, obj["current_period_end"])
+        if event.created >= user.last_event_ts:
+            user.plan_tier = plan
+            user.last_event_ts = event.created
+    return {"status": "processed"}
+
+
+def test_consistency_without_invoice_effect_is_rejected_without_reference(monkeypatch):
+    from chaoshook_engine import runner
+    from chaoshook_engine.snapshot import diff_states
+
+    def unexpected_reference(*args, **kwargs):
+        pytest.fail("the reference handler must not determine acceptance")
+
+    monkeypatch.setattr(v2_patched, "process_stripe_webhook", unexpected_reference)
+    original_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "target_app.handlers.v2_patched" or (
+            name == "target_app.handlers" and "v2_patched" in (fromlist or ())
+        ):
+            pytest.fail("the correctness gate must not import the reference handler")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    # Load the runner afresh under the guard, so a cached import cannot hide a
+    # production dependency. This neither installs nor replaces any candidate.
+    spec = importlib.util.spec_from_file_location("_independent_runner", runner.__file__)
+    independent_runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(independent_runner)
+    report = independent_runner.run_algebraic_prover(_consistent_handler_without_invoice_credit)
+
+    normal_order = report["cells"][0]["actual_state"]
+    assert report["cells"][0]["sequence"] == ["e1", "e2", "e3", "e4"]
+    missing_effects = {"user.credit_balance", "credit_ledger_rows", "credit_ledger_sum"}
+    assert {item["field"] for item in diff_states(report["golden_state"], normal_order)} == missing_effects
+    for cell in report["cells"][:24]:
+        # A self-derived normal-order oracle would incorrectly accept every order.
+        assert cell["actual_state"] == normal_order
+        assert diff_states(normal_order, cell["actual_state"]) == []
+        assert not cell["passed"]
+        assert {item["field"] for item in cell["property_violations"]} == missing_effects
+    assert normal_order["user"]["credit_balance"] == 0
+    assert normal_order["credit_ledger_rows"] == normal_order["credit_ledger_sum"] == 0
+    assert report["passed_cells"] == 0
+
+
+@pytest.mark.parametrize("field, wrong_value", [
+    ("invoice_id", "in_wrong_invoice"), ("user_id", "usr_wrong_recipient"),
+])
+def test_independent_contract_rejects_misattributed_ledger(tmp_path, field, wrong_value):
+    from sqlalchemy.orm import Session
+    from chaoshook_engine.fixtures import get_canonical_events, sign_event
+    from chaoshook_engine.snapshot import create_cell_engine, extract_comparable_state, seed_initial_state
+    from target_app.models import Base, CreditLedger
+
+    engine = create_cell_engine(tmp_path / "ledger.db")
+    try:
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            seed_initial_state(session)
+            for payload in get_canonical_events():
+                v2_patched.process_stripe_webhook(session, *sign_event(payload))
+            assert SCENARIO_SPEC.validate(session, extract_comparable_state(session)) == []
+            setattr(session.query(CreditLedger).one(), field, wrong_value)
+            session.commit()
+            actual = extract_comparable_state(session)
+            assert actual == SCENARIO_SPEC.expected_state()  # Aggregates still match.
+            violations = SCENARIO_SPEC.validate(session, actual)
+            assert [item["field"] for item in violations] == ["credit_ledger.identity"]
+            assert SCENARIO_SPEC.validate(session, actual, ["unexpected delivery error"])[-1] == {
+                "field": "execution.errors", "expected": [], "actual": ["unexpected delivery error"],
+            }
+    finally:
+        engine.dispose()
+
+
+def test_correct_state_with_unexpected_errors_is_rejected():
+    def fails_after_commit(session, raw_body, sig_header):
+        v2_patched.process_stripe_webhook(session, raw_body, sig_header)
+        raise ValueError("failure after commit")
+
+    report = run_algebraic_prover(fails_after_commit)
+    assert report["passed_cells"] == 0
+    for cell in report["cells"]:
+        assert cell["actual_state"] == report["golden_state"]
+        assert cell["state_diff"] == []
+        assert {item["field"] for item in cell["property_violations"]} == {"execution.errors"}
+        assert cell["failure_tag"] == "HANDLER_ERROR"
 
 
 def test_unexpected_handler_errors_complete_matrix(reports):
@@ -404,7 +552,7 @@ def test_partial_handler_proves_atomicity_but_fails_ordering(partial_code):
     result = verify_candidate_patch(partial_code)
     assert result["import_error"] is None
     assert result["verified"] is False
-    assert 6 < result["passed_cells"] < 27
+    assert result["passed_cells"] == 9
     cells = result["prover_report"]["cells"]
     assert all(cell["passed"] for cell in cells[24:])
     assert any(not cell["passed"] for cell in cells[:24])
