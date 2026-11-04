@@ -222,6 +222,7 @@ __marimo__/
 docs/*
 !docs/ADVERSARIAL_AUDIT_RESPONSE.md
 !docs/ARCHITECTURE.md
+!docs/experiments
 AGENTS.md
 
 # Frontend dependencies installed by npm ci
