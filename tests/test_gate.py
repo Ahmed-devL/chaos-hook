@@ -1258,3 +1258,185 @@ def test_mutation_summary(mutation_results, tmp_path):
     assert json.loads(path.read_text(encoding='utf-8')) == summary
     assert len(valid) == 15 and len(detected) == 5, summary
     assert summary['surviving_mutations'] == [], summary
+
+
+def test_cegis_audit_first_round_success_preserves_guided_request(monkeypatch, reports):
+    from dataclasses import asdict
+    from hashlib import sha256
+    from chaoshook_engine.muse_client import WONDER_PROMPT
+
+    contract = asdict(SCENARIO_SPEC)
+    source = Path(v2_patched.__file__).read_text(encoding='utf-8')
+    client, calls = _fake_wonder(monkeypatch, [source])
+    result = _extract_patch(client, reports['vulnerable'])
+    audit = client.model_routing
+    assert result['patched_code'] == source
+    assert len(calls) == len(audit['cegis_rounds']) == len(audit['candidate_attempts']) == 1
+    assert calls[0]['messages'][0]['content'] == WONDER_PROMPT
+    assert set(json.loads(calls[0]['messages'][1]['content'])) == {
+        'schema_code', 'handler_code', 'prover_report', 'handler_contract'}
+    attempt = audit['candidate_attempts'][0]
+    assert attempt['attempt_index'] == attempt['cegis_round'] == 1
+    assert attempt['candidate_sha256'] == sha256(source.encode()).hexdigest()
+    assert attempt['model_identifier'] == client.wonder_model
+    assert attempt['provenance'] == 'live_model_response'
+    assert attempt['result'] == 'accepted' and attempt['autonomous_repair']
+    assert attempt['configured_check_ids'] == attempt['executed_check_ids'] == attempt['passed_check_ids'] == list(range(1, 28))
+    assert attempt['failed_check_ids'] == attempt['business_property_violations'] == []
+    assert attempt['feedback_evidence_indices'] == [0]
+    assert attempt['feedback_properties']
+    assert attempt['regression_check_ids'] == attempt['regression_passed_check_ids']
+    assert audit['selected_candidate'] == attempt
+    assert audit['verification_scope']['additional_scenario_evaluation'] == 'separate_not_run'
+    assert audit['verification_scope']['held_out_checks_executed'] == []
+    assert audit['verification_scope']['mutation_controls'] == 'regression_only_not_acceptance'
+    assert asdict(SCENARIO_SPEC) == contract
+
+
+def test_cegis_audit_retains_feedback_and_real_candidate_hashes(monkeypatch, reports, partial_code):
+    from hashlib import sha256
+
+    source = Path(v2_patched.__file__).read_text(encoding='utf-8')
+    client, calls = _fake_wonder(monkeypatch, [partial_code, source])
+    _extract_patch(client, reports['vulnerable'])
+    first, second = client.model_routing['candidate_attempts']
+    assert first['result'] == 'rejected' and second['result'] == 'accepted'
+    assert [first['candidate_sha256'], second['candidate_sha256']] == [
+        sha256(code.encode()).hexdigest() for code in (partial_code, source)]
+    evidence = client.model_routing['regression_evidence']
+    assert len(evidence) == 2
+    assert all(item['role'] == 'synthesis_feedback' and item['scenario'] == 'legacy' for item in evidence)
+    assert second['feedback_evidence_indices'] == [1]
+    assert second['feedback_properties'] == sorted(p['field'] for p in evidence[1]['business_properties'])
+    assert evidence[1]['candidate_sha256'] == first['candidate_sha256']
+    assert evidence[1]['business_properties'] == first['business_property_violations']
+    assert first['business_property_violations']
+    assert first['failed_check_ids'] == evidence[1]['failed_check_ids']
+    assert set(first['failed_check_ids']) <= set(second['regression_passed_check_ids'])
+    assert all(item['contract_sha256'] == first['contract_sha256'] for item in (first, second))
+    # Existing bounded feedback is the next request's actual observed failures.
+    feedback = json.loads(calls[1]['messages'][1]['content'])['prover_report']
+    assert feedback['summary']['failed_cell_ids'] == first['failed_check_ids']
+
+
+@pytest.mark.parametrize('forced_cache', [True, False])
+def test_cegis_audit_fallback_never_claims_live_generation(monkeypatch, reports, partial_code, forced_cache):
+    client, calls = _fake_wonder(monkeypatch, [partial_code, partial_code])
+    client.force_cache = forced_cache
+    _extract_patch(client, reports['vulnerable'])
+    attempts = client.model_routing['candidate_attempts']
+    assert len(calls) == len(client.model_routing['cegis_rounds']) == (0 if forced_cache else 2)
+    assert len(attempts) == (1 if forced_cache else 3)
+    cached = attempts[-1]
+    assert cached['attempt_index'] == len(attempts)
+    assert cached['cegis_round'] is cached['model_identifier'] is None
+    assert cached['provenance'] == 'cached_fallback' and not cached['autonomous_repair']
+    assert cached['result'] == 'accepted'
+    assert cached['executed_check_ids'] == cached['passed_check_ids'] == list(range(1, 28))
+    assert not client.model_routing['wonder_live']
+    assert client.model_routing['selected_candidate'] == cached
+
+
+def test_cegis_audit_import_failure_is_not_business_rejection(monkeypatch, reports):
+    source = Path(v2_patched.__file__).read_text(encoding='utf-8')
+    broken = "def process_stripe_webhook(*args): pass\nraise ImportError('cegis-secret Authorization: Bearer unrelated-private-token')\n"
+    client, _ = _fake_wonder(monkeypatch, [broken, source])
+    _extract_patch(client, reports['vulnerable'])
+    first = client.model_routing['candidate_attempts'][0]
+    assert first['result'] == 'rejected'
+    assert first['executed_check_ids'] == first['failed_check_ids'] == first['business_property_violations'] == []
+    assert first['import_error'] and not first['verification_error']
+    recorded = json.dumps(client.model_routing)
+    assert 'cegis-secret' not in recorded and 'unrelated-private-token' not in recorded
+    assert 'private.invalid' not in recorded
+
+
+def test_cegis_audit_verifier_failure_and_failed_cache_are_not_success(monkeypatch, reports):
+    from chaoshook_engine import muse_client
+
+    source = Path(v2_patched.__file__).read_text(encoding='utf-8')
+    client, calls = _fake_wonder(monkeypatch, [source])
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError('verifier unavailable cegis-secret')
+
+    monkeypatch.setattr(muse_client, 'verify_candidate_patch', unavailable)
+    # Preserve offline availability but never label unchecked output accepted.
+    result = _extract_patch(client, reports['vulnerable'])
+    assert result['patched_code']
+    assert len(calls) == 1 and client.model_routing['cegis_rounds'] == []
+    assert len(client.model_routing['candidate_attempts']) == 2
+    assert client.model_routing['selected_candidate'] is None
+    for attempt in client.model_routing['candidate_attempts']:
+        assert attempt['result'] == 'rejected' and not attempt['autonomous_repair']
+        assert attempt['verification_error'] and attempt['executed_check_ids'] == []
+    assert 'cegis-secret' not in json.dumps(client.model_routing)
+
+
+def test_cegis_audit_structurally_invalid_response_records_actual_source(monkeypatch, reports):
+    from hashlib import sha256
+
+    source = 'def process_stripe_webhook(*args): pass\n'
+    client, calls = _fake_wonder(monkeypatch, [])
+
+    def request(*args, **kwargs):
+        calls.append(kwargs['json'])
+        return {'model': 'muse-wonder-1.0', 'choices': [{'message': {'content': json.dumps({
+            'patched_code': source, 'invariants': [],
+        })}}]}
+
+    monkeypatch.setattr(client, 'api_request', request)
+    _extract_patch(client, reports['vulnerable'])
+    first, cached = client.model_routing['candidate_attempts']
+    assert first['candidate_sha256'] == sha256(source.encode()).hexdigest()
+    assert first['provenance'] == 'live_model_response'
+    assert first['response_model_identifier'] == 'muse-wonder-1.0'
+    assert first['result'] == 'rejected' and first['executed_check_ids'] == []
+    assert 'structured output' in first['verification_error']
+    assert cached['provenance'] == 'cached_fallback'
+    assert len(calls) == 1 and client.model_routing['cegis_rounds'] == []
+
+
+def test_cegis_audit_bounds_evidence_and_resets_per_run(monkeypatch, reports):
+    from copy import deepcopy
+
+    client, _ = _fake_wonder(monkeypatch, [])
+    report = {'cells': [{'id': i, 'passed': False, 'property_violations': [
+        {'field': 'property_' + str(j), 'expected': 'cegis-secret' * 1000, 'actual': 'x' * 10000}
+        for j in range(40)]} for i in range(1, 28)]}
+    summary = client._evidence_summary(report)
+    assert len(json.dumps(summary)) < 15000
+    assert summary['omitted_property_count'] == 24
+    assert summary['failed_check_ids'] == list(range(1, 28))
+    assert 'cegis-secret' not in json.dumps(summary)
+    client.force_cache = True
+    _extract_patch(client, reports['vulnerable'])
+    previous = deepcopy(client.model_routing['candidate_attempts'])
+    _extract_patch(client, reports['patched'])
+    assert len(client.model_routing['candidate_attempts']) == 1
+    assert client.model_routing['candidate_attempts'][0]['feedback_evidence_indices'] == []
+    assert previous[0]['regression_check_ids']
+    assert client.model_routing['regression_evidence'][0]['failed_check_ids'] == []
+
+
+def test_prepared_verification_source_has_explicit_hash():
+    from hashlib import sha256
+    from chaoshook_engine.patcher import verify_candidate_patch
+
+    source = 'def process_stripe_webhook(*args): pass\nraise ImportError("prepared")\n'
+    result = verify_candidate_patch(source)
+    assert result['candidate_sha256'] == sha256(source.encode()).hexdigest()
+    assert result['provenance'] == 'prepared'
+    assert result['configured_check_ids'] == list(range(1, 28))
+    assert result['executed_check_ids'] == [] and not result['verified']
+
+
+def test_cegis_import_feedback_is_bounded_before_next_request(monkeypatch, reports):
+    source = Path(v2_patched.__file__).read_text(encoding='utf-8')
+    broken = "def process_stripe_webhook(*args): pass\nraise ImportError('" + 'x' * 20000 + "')\n"
+    client, calls = _fake_wonder(monkeypatch, [broken, source])
+    _extract_patch(client, reports['vulnerable'])
+    feedback = json.loads(calls[1]['messages'][1]['content'])['prover_report']
+    assert len(feedback['import_error']) <= 1000
+    assert len(client.model_routing['regression_evidence'][1]['import_error']) <= 300
+    assert client.model_routing['candidate_attempts'][-1]['result'] == 'accepted'

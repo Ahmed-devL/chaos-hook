@@ -2,6 +2,7 @@
 
 import difflib
 import importlib
+from hashlib import sha256
 from pathlib import Path
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -19,7 +20,10 @@ def verify_candidate_patch(code: str) -> dict:
     from chaoshook_engine.runner import run_algebraic_prover
 
     result = {"verified": False, "passed_cells": 0, "total_cells": 27,
-              "failed_cell_ids": [], "prover_report": None, "import_error": None}
+              "failed_cell_ids": [], "prover_report": None, "import_error": None,
+              "candidate_sha256": sha256(code.encode("utf-8")).hexdigest(),
+              "provenance": "prepared", "configured_check_ids": list(range(1, 28)),
+              "executed_check_ids": []}
     with TemporaryDirectory(prefix="chaoshook-candidate-", dir="/tmp") as directory:
         path = Path(directory) / "candidate.py"
         path.write_text(code, encoding="utf-8")
@@ -40,6 +44,7 @@ def verify_candidate_patch(code: str) -> dict:
             result.update(
                 verified=report["passed_cells"] == report["total_cells"] == 27,
                 passed_cells=report["passed_cells"], prover_report=report,
+                executed_check_ids=[cell["id"] for cell in report["cells"]],
                 failed_cell_ids=[cell["id"] for cell in report["cells"] if not cell["passed"]],
             )
             return result

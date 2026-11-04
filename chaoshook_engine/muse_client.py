@@ -1,6 +1,8 @@
 """Muse model routing with a deterministic, locally verified demo cache."""
 
 from copy import deepcopy
+from dataclasses import asdict
+from hashlib import sha256
 from itertools import permutations
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -176,7 +178,9 @@ class MuseNeuroSymbolicClient:
                        self.base_url, os.getenv("MUSE_BASE_URL"), os.getenv("META_BASE_URL")):
             if secret:
                 result = result.replace(secret, "[REDACTED]")
-        return result
+        result = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", r"\1 [REDACTED]", result)
+        return re.sub(r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)([^\"'\r\n,}]+)",
+                      r"\1[REDACTED]", result)
 
     def api_request(self, method, path, **kwargs):
         if not self.api_key:
@@ -231,6 +235,9 @@ class MuseNeuroSymbolicClient:
                                      flags=re.IGNORECASE)
                     content = re.sub(r"\s*```$", "", content)
                 result = json.loads(content)
+                if part == "wonder" and isinstance(result, dict) and isinstance(result.get("patched_code"), str):
+                    self._wonder_response_source = result["patched_code"]
+                    self._wonder_response_model = response.get("model")
                 if not validate(result):
                     raise ValueError("model response violates the structured output contract")
                 return result
@@ -300,6 +307,74 @@ class MuseNeuroSymbolicClient:
                 "Event claim, ledger and outbox commit together or all roll back.", [26, 27]),
         ]
 
+    def _evidence_summary(self, report, import_error=None):
+        """Bound untrusted evidence without retaining source, SQL, or headers.
+
+        All failed check IDs are retained; property samples are capped and their
+        omitted count is explicit. Full schedules rerun on every candidate.
+        """
+        properties = {}
+        execution_errors = []
+        cells = report.get("cells", [])
+        for cell in cells:
+            for violation in cell.get("property_violations", cell.get("state_diff", [])):
+                field = self.safe_error(violation["field"])[:160]
+                if field == "execution.errors":
+                    execution_errors.extend(self.safe_error(error)[:300]
+                                            for error in violation["actual"][:3])
+                    continue
+                if field not in properties:
+                    properties[field] = {"field": field, "cell_ids": [],
+                                         "expected": self.safe_error(str(violation.get("expected")))[:240],
+                                         "actual": self.safe_error(str(violation.get("actual")))[:240]}
+                properties[field]["cell_ids"].append(cell["id"])
+        return {
+            "role": "synthesis_feedback", "scenario": "legacy", "seed": None,
+            "failed_check_ids": [cell["id"] for cell in cells if not cell["passed"]],
+            "business_properties": list(properties.values())[:16],
+            "omitted_property_count": max(0, len(properties) - 16),
+            "execution_errors": execution_errors[:3],
+            "import_error": self.safe_error(import_error)[:300] if import_error else None,
+        }
+
+    def _audit_candidate(self, code, provenance, round_number, verification=None, error=None):
+        report = (verification or {}).get("prover_report") or {}
+        summary = self._evidence_summary(report, (verification or {}).get("import_error"))
+        cells = report.get("cells", [])
+        prior = self.model_routing["regression_evidence"]
+        previous_ids = sorted({check for item in prior for check in item["failed_check_ids"]})
+        accepted = bool((verification or {}).get("verified")) and error is None
+        record = {
+            "attempt_index": len(self.model_routing["candidate_attempts"]) + 1,
+            "cegis_round": round_number, "provenance": provenance,
+            "model_identifier": self.safe_error(self.wonder_model) if provenance == "live_model_response" else None,
+            "response_model_identifier": (self.safe_error(self._wonder_response_model)[:160]
+                                          if provenance == "live_model_response" and self._wonder_response_model else None),
+            "candidate_sha256": sha256(code.encode("utf-8")).hexdigest(),
+            "contract_sha256": self.model_routing["verification_scope"]["contract_sha256"],
+            "configured_check_ids": list(range(1, 28)),
+            "executed_check_ids": [cell["id"] for cell in cells],
+            "passed_check_ids": [cell["id"] for cell in cells if cell["passed"]],
+            "failed_check_ids": [cell["id"] for cell in cells if not cell["passed"]],
+            "business_property_violations": summary["business_properties"],
+            "omitted_property_count": summary["omitted_property_count"],
+            "execution_errors": summary["execution_errors"], "import_error": summary["import_error"],
+            "verification_error": self.safe_error(error)[:300] if error else None,
+            "feedback_evidence_indices": [len(prior) - 1] if provenance == "live_model_response" else [],
+            "feedback_properties": sorted({p["field"] for item in prior[-1:] for p in item["business_properties"]})
+                                   if provenance == "live_model_response" else [],
+            "regression_check_ids": previous_ids,
+            "regression_passed_check_ids": [cell["id"] for cell in cells
+                                             if cell["id"] in previous_ids and cell["passed"]],
+            "result": "accepted" if accepted else "rejected",
+            "autonomous_repair": accepted and provenance == "live_model_response",
+        }
+        self.model_routing["candidate_attempts"].append(record)
+        if not accepted:
+            summary["candidate_sha256"] = record["candidate_sha256"]
+            self.model_routing["regression_evidence"].append(summary)
+        self.model_routing["selected_candidate"] = deepcopy(record) if accepted else None
+
     def extract_invariants_and_patch(self, schema_code: str, handler_code: str,
                                      prover_report: dict) -> dict:
         reference = (HANDLER_DIR / "v2_patched.py").read_text(encoding="utf-8")
@@ -322,7 +397,33 @@ class MuseNeuroSymbolicClient:
                    "prover_report": prover_report,
                    "handler_contract": "process_stripe_webhook(session, raw_body, sig_header) -> dict\n" + WONDER_PROMPT.split(
                        "The handler_contract is an interface description:", 1)[1].strip()}
-        self.model_routing["cegis_rounds"] = []
+        # Audit fields are additive; legacy cegis_rounds continues to contain
+        # only actual live candidate verifications, never fallback selections.
+        from chaoshook_engine.scenario_spec import SCENARIO_SPEC
+
+        self.model_routing.update(
+            cegis_rounds=[], candidate_attempts=[], selected_candidate=None,
+            regression_evidence=[self._evidence_summary(prover_report)],
+            verification_scope={
+                "acceptance": "legacy_27_cells", "synthesis_mode": "guided",
+                "contract_sha256": sha256(json.dumps(asdict(SCENARIO_SPEC), sort_keys=True).encode()).hexdigest(),
+                "additional_scenario_evaluation": "separate_not_run",
+                "mutation_controls": "regression_only_not_acceptance",
+                "held_out_checks_executed": [],
+            },
+        )
+
+        def cached_fallback():
+            # Record checks actually executed for this source; never invent a
+            # live round or infer current success from an earlier cached proof.
+            try:
+                verification = verify_candidate_patch(reference)
+            except Exception as exc:
+                self._audit_candidate(reference, "cached_fallback", None, error=exc)
+            else:
+                self._audit_candidate(reference, "cached_fallback", None, verification)
+            return fallback
+
         max_rounds = 2
         started = perf_counter()
         time_budget = 240.0
@@ -332,25 +433,32 @@ class MuseNeuroSymbolicClient:
                 self._record_route("wonder", False,
                                    "CEGIS round 2 skipped: projected runtime exceeds "
                                    "240-second total time budget; using verified cache")
-                return fallback
+                return cached_fallback()
             prompt = WONDER_PROMPT
             if round_number > 1:
                 prompt += ("\nRepair your own previous patch in handler_code using the "
                            "remaining counterexamples and import_error in prover_report. "
                            "Return the same strict JSON contract.")
+            self._wonder_response_source = None
+            self._wonder_response_model = None
             candidate = self._request("wonder", self.wonder_model, prompt,
                                       payload, fallback, valid,
                                       request_timeout=min(self.timeout, time_budget - elapsed))
             # _request handles forced cache, unusable keys and network failures.
             if not self.model_routing["wonder_live"]:
-                return fallback
+                if self._wonder_response_source is not None:
+                    self._audit_candidate(self._wonder_response_source, "live_model_response", round_number,
+                                          error="structured output rejected before verification")
+                return cached_fallback()
             try:
                 verification = verify_candidate_patch(candidate["patched_code"])
             except Exception as exc:
+                self._audit_candidate(candidate["patched_code"], "live_model_response", round_number, error=exc)
                 self._record_route("wonder", False,
                                    "candidate verification failed: " + self.safe_error(exc))
-                return fallback
-            import_error = (self.safe_error(verification["import_error"])
+                return cached_fallback()
+            self._audit_candidate(candidate["patched_code"], "live_model_response", round_number, verification)
+            import_error = (self.safe_error(verification["import_error"])[:1000]
                             if verification["import_error"] else None)
             self.model_routing["cegis_rounds"].append({
                 "round": round_number, "passed_cells": verification["passed_cells"],
@@ -367,7 +475,7 @@ class MuseNeuroSymbolicClient:
         self._record_route("wonder", False,
                            f"CEGIS exhausted {max_rounds} rounds without a verified patch; "
                            "using verified cache")
-        return fallback
+        return cached_fallback()
 
     def diagnose_multimodal_divergence(self, prover_report: dict,
                                       diagram_description: str | None = None,
