@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Code2, Gauge, LoaderCircle, Play, RotateCcw, Sparkles } from 'lucide-react';
-import { getStatus, prove, diagnose, patch, reset } from './api.js';
+import { getStatus, prove, diagnose, patch, reset, updateSource } from './api.js';
 import ProofMatrixGrid from './components/ProofMatrixGrid.jsx';
 import StateDiffInspector from './components/StateDiffInspector.jsx';
 import MuseNeuroSymbolicPanel, { builtInDiagramPng } from './components/MuseNeuroSymbolicPanel.jsx';
@@ -11,16 +11,21 @@ function defaultCell(cells) {
     ?? cells.find((cell) => !cell.passed) ?? cells[0])?.id ?? null;
 }
 
-function ModeBadge({ mode }) {
+function ModeBadge({ mode, passedCells }) {
+  const custom = mode === 'patched' && passedCells < 27;
   return (
-    <span className={`inline-block rounded border px-2 py-1 font-mono text-[10px] font-semibold tracking-wider ${mode === 'patched' ? 'border-emerald/40 bg-emerald/10 text-emerald' : mode === 'vulnerable' ? 'border-crimson/40 bg-crimson/10 text-crimson' : 'border-slate-700 text-slate-400'}`}>
-      {mode === 'patched' ? 'ATOMIC PATCH ACTIVE' : mode === 'vulnerable' ? 'VULNERABLE BASELINE' : 'AWAITING STATUS'}
+    <span className={`inline-block rounded border px-2 py-1 font-mono text-[10px] font-semibold tracking-wider ${custom ? 'border-amber-500/40 bg-amber-500/10 text-amber-400' : mode === 'patched' ? 'border-emerald/40 bg-emerald/10 text-emerald' : mode === 'vulnerable' ? 'border-crimson/40 bg-crimson/10 text-crimson' : 'border-slate-700 text-slate-400'}`}>
+      {custom ? `CUSTOM EDIT (${passedCells}/27)` : mode === 'patched' ? 'ATOMIC PATCH ACTIVE' : mode === 'vulnerable' ? 'VULNERABLE BASELINE' : 'AWAITING STATUS'}
     </span>
   );
 }
 
 export default function App() {
   const [status, setStatus] = useState(null);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [editError, setEditError] = useState(null);
+  const gutterRef = useRef(null);
   const [report, setReport] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [analysis, setAnalysis] = useState(null);
@@ -133,6 +138,21 @@ export default function App() {
       displayReport(result.prover_report);
       setStatus(await getStatus());
       setPatchOpen(false);
+      setEditing(false);
+      setEditError(null);
+    });
+  }
+
+  function saveEdit() {
+    return request('edit', async () => {
+      setEditError(null);
+      try {
+        const result = await updateSource(draft);
+        displayReport(result.prover_report);
+        setStatus((previous) => ({ ...previous, ...result.handler_status }));
+      } catch (cause) {
+        setEditError(cause instanceof Error ? cause.message : String(cause));
+      }
     });
   }
 
@@ -161,7 +181,7 @@ export default function App() {
             </p>
             <div className="flex flex-wrap items-center gap-3 sm:justify-end">
               <span className="font-mono text-xs tabular-nums text-slate-400">Execution time: {report ? `${report.duration_ms.toFixed(3)} ms` : '—'}</span>
-              <ModeBadge mode={status?.mode} />
+              <ModeBadge mode={status?.mode} passedCells={report?.passed_cells} />
             </div>
           </div>
         </div>
@@ -180,7 +200,7 @@ export default function App() {
             </div>
           ))}
         </nav>
-        {busy && <p role="status" className="mt-3 flex items-center gap-2 text-xs text-brass"><LoaderCircle size={14} aria-hidden="true" className="animate-spin" />{pending === 'diagnose' ? `${instantMode ? 'Loading verified cached analysis' : 'Muse Wonder + Spark 1.3 running live (about 40s)'} · ${diagnosisSeconds}s elapsed` : pending === 'load' ? 'Reading active handler and running all 27 proof cells…' : 'Instrument running · awaiting backend result…'}</p>}
+        {busy && <p role="status" className="mt-3 flex items-center gap-2 text-xs text-brass"><LoaderCircle size={14} aria-hidden="true" className="animate-spin" />{pending === 'diagnose' ? `${instantMode ? 'Loading verified cached analysis' : 'Muse Wonder + Spark 1.3 running live (typically 2–3 minutes) (Muse Wonder reasons through the repair before answering)'} · ${diagnosisSeconds}s elapsed` : pending === 'load' ? 'Reading active handler and running all 27 proof cells…' : 'Instrument running · awaiting backend result…'}</p>}
       </header>
 
       {error && <div role="alert" className="mx-auto mb-6 max-w-[2400px] whitespace-pre-wrap break-words rounded-lg border border-crimson/50 bg-crimson/10 p-4 text-sm text-crimson">{error}</div>}
@@ -189,17 +209,35 @@ export default function App() {
         <section aria-labelledby="code-heading" className="min-w-0 rounded-lg border border-slate-800 bg-slate-900">
           <header className="space-y-3 border-b border-slate-800 p-5">
             <h2 id="code-heading" className="flex items-center gap-2 text-lg font-semibold"><Code2 size={18} aria-hidden="true" className="text-brass" />Target Code</h2>
-            <ModeBadge mode={status?.mode} />
+            <ModeBadge mode={status?.mode} passedCells={report?.passed_cells} />
             <p className="break-all font-mono text-xs text-slate-400">target_app/handlers/active_handler.py</p>
+            <label className="flex items-center gap-2 text-xs text-slate-300">
+              <input type="checkbox" checked={editing} disabled={busy || !status} className="accent-amber-500"
+                onChange={(event) => { setEditing(event.target.checked); setDraft(status.active_code); setEditError(null); }} />
+              Edit Live Code
+            </label>
           </header>
-          <div role="region" aria-label="Active handler source" tabIndex={0} className="max-h-[65vh] overflow-auto bg-slate-950 py-4 font-mono text-xs leading-6">
+          {editing ? <>
+            <div className="flex h-[65vh] bg-slate-950 py-4 font-mono text-xs leading-6">
+              <pre ref={gutterRef} aria-hidden="true" className="m-0 w-12 shrink-0 select-none overflow-hidden border-r border-slate-800 pr-3 text-right tabular-nums text-slate-500">{draft.split('\n').map((_, index) => index + 1).join('\n')}</pre>
+              <textarea aria-label="Edit active handler source" value={draft} disabled={busy} spellCheck={false} wrap="off"
+                onChange={(event) => setDraft(event.target.value)}
+                onScroll={(event) => { gutterRef.current.scrollTop = event.target.scrollTop; }}
+                className="min-w-0 flex-1 resize-none bg-transparent px-4 py-0 font-mono text-xs leading-6 text-slate-300 focus:outline-none" />
+            </div>
+            <div className="space-y-3 border-t border-slate-800 p-4">
+              {editError && <p role="alert" className="whitespace-pre-wrap break-words text-xs text-crimson">{editError}</p>}
+              <button type="button" disabled={busy} onClick={saveEdit} className="rounded border border-brass px-3 py-2 text-xs text-brass disabled:opacity-50">Save Edit &amp; Run 27-Cell Prover</button>
+              <button type="button" disabled={busy || !status?.partial_patch_code} onClick={() => { setDraft(status.partial_patch_code); setEditError(null); }} className="rounded border border-slate-700 px-3 py-2 text-xs text-slate-300 disabled:opacity-50">Load naive partial patch</button>
+            </div>
+          </> : <div role="region" aria-label="Active handler source" tabIndex={0} className="max-h-[65vh] overflow-auto bg-slate-950 py-4 font-mono text-xs leading-6">
             {status ? status.active_code.split('\n').map((line, index) => (
               <div key={index} className="flex min-w-max pr-5 hover:bg-slate-900">
                 <span aria-hidden="true" className="sticky left-0 mr-4 w-12 shrink-0 select-none border-r border-slate-800 bg-slate-950 pr-3 text-right tabular-nums text-slate-500">{index + 1}</span>
                 <code className="whitespace-pre text-slate-300">{line || ' '}</code>
               </div>
             )) : <p className="px-5 text-slate-500">Waiting for active handler source…</p>}
-          </div>
+          </div>}
         </section>
 
         <div className="min-w-0">

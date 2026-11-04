@@ -15,7 +15,7 @@ from chaoshook_engine.patcher import (
     HANDLER_DIR, apply_patch_to_active, get_active_handler_status, reset_active_to_vulnerable,
     verify_candidate_patch,
 )
-from chaoshook_engine.runner import run_algebraic_prover
+from chaoshook_engine.runner import export_pytest_code, run_algebraic_prover
 from target_app.handlers import active_handler
 
 
@@ -45,6 +45,10 @@ class DiagnoseRequest(BaseModel):
 
 class PatchRequest(BaseModel):
     patched_code: str | None = None
+
+
+class UpdateSourceRequest(BaseModel):
+    source_code: str
 
 
 def _prove(handler_status: dict, *, force: bool = False) -> dict:
@@ -87,6 +91,11 @@ def status() -> dict:
 def prove() -> dict:
     with _lock:
         return _proof_response(get_active_handler_status())
+
+
+@app.get("/api/export-pytest")
+def export_pytest() -> dict:
+    return {"filename": "test_webhook_invariance.py", "pytest_code": export_pytest_code()}
 
 
 @app.post("/api/diagnose")
@@ -141,3 +150,25 @@ def patch(body: PatchRequest | None = None) -> dict:
 def reset() -> dict:
     with _lock:
         return _proof_response(reset_active_to_vulnerable())
+
+
+@app.post("/api/update-source")
+def update_source(body: UpdateSourceRequest) -> dict:
+    code = body.source_code
+    if not code.strip():
+        raise HTTPException(400, "Source code must not be empty")
+    if len(code.encode("utf-8")) > 100_000:
+        raise HTTPException(400, "Source code exceeds 100 KB")
+    try:
+        compile(code, "active_handler.py", "exec")
+    except SyntaxError as exc:
+        raise HTTPException(400, f"Line {exc.lineno}: {exc.msg}") from None
+    except ValueError:
+        raise HTTPException(400, "Source code could not be compiled") from None
+    with _lock:
+        try:
+            handler_status = apply_patch_to_active(code)
+        except Exception:
+            # Do not expose exception text from user-supplied module execution.
+            raise HTTPException(400, "Handler source could not be loaded; previous source restored") from None
+        return _proof_response(handler_status)

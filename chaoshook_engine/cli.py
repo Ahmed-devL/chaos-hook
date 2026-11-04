@@ -10,7 +10,7 @@ from time import perf_counter
 
 from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
 from chaoshook_engine.patcher import HANDLER_DIR
-from chaoshook_engine.runner import run_algebraic_prover
+from chaoshook_engine.runner import export_pytest_code, run_algebraic_prover
 from target_app.handlers import v1_vulnerable, v2_patched
 
 
@@ -109,7 +109,13 @@ def main(argv=None) -> int:
     verify.add_argument("--mode", choices=("vulnerable", "patched", "both"), default="both")
     commands.add_parser("ping-muse", help="Discover and ping configured live Muse models")
     commands.add_parser("live-patch-check", help="Prove a live Wonder patch without installing it")
+    export = commands.add_parser("export-pytest", help="Export the 27-cell pytest regression suite")
+    export.add_argument("--out", type=Path, default=Path("test_webhook_invariance.py"))
     args = parser.parse_args(argv)
+    if args.command == "export-pytest":
+        args.out.write_text(export_pytest_code(), encoding="utf-8")
+        print(f"Exported pytest suite to {args.out}")
+        return 0
     if args.command == "ping-muse":
         return ping_muse()
     if args.command == "live-patch-check":

@@ -23,6 +23,48 @@ from target_app.handlers.v2_patched import process_stripe_webhook as reference_h
 from target_app.models import Base
 
 
+def export_pytest_code() -> str:
+    """Return a reusable pytest suite that proves the currently active handler."""
+    return '''"""Webhook invariance regression suite exported by ChaosHook."""
+
+from pathlib import Path
+import sys
+
+import pytest
+
+# Support plain pytest when this file is saved at the repo root or under tests/.
+for root in Path(__file__).resolve().parents:
+    if (root / "target_app").is_dir() and (root / "chaoshook_engine").is_dir():
+        sys.path.insert(0, str(root))
+        break
+
+from target_app.handlers import active_handler
+from chaoshook_engine.runner import run_algebraic_prover
+
+
+@pytest.fixture(scope="module")
+def invariance_report():
+    return run_algebraic_prover(active_handler.process_stripe_webhook)
+
+
+@pytest.mark.parametrize("cell_id", range(1, 25))
+def test_order_commutativity_all_24_permutations(invariance_report, cell_id):
+    cell = invariance_report["cells"][cell_id - 1]
+    assert cell["passed"], cell["failure_reason"]
+
+
+def test_parallel_duplicate_sql_barrier_idempotency(invariance_report):
+    cell = invariance_report["cells"][24]
+    assert cell["passed"], cell["failure_reason"]
+
+
+@pytest.mark.parametrize("cell_id", [26, 27])
+def test_mid_handler_crash_retry_atomicity(invariance_report, cell_id):
+    cell = invariance_report["cells"][cell_id - 1]
+    assert cell["passed"], cell["failure_reason"]
+'''
+
+
 @contextmanager
 def _cell(path, trace, seed=None, engine=None):
     if seed is not None:

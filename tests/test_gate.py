@@ -2,7 +2,10 @@
 
 import json
 from itertools import permutations
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 
 import pytest
@@ -613,3 +616,139 @@ def test_diagnose_passes_image_to_spark(monkeypatch):
     assert response.status_code == 200
     assert seen == [image]
     assert response.json()['model_routing']['spark_multimodal'] is False
+
+
+@pytest.fixture
+def source_editor():
+    from fastapi.testclient import TestClient
+    from chaoshook_engine import server
+    from chaoshook_engine.patcher import HANDLER_DIR, apply_patch_to_active
+
+    active = HANDLER_DIR / "active_handler.py"
+    original = active.read_text(encoding="utf-8")
+    try:
+        yield TestClient(server.app), active
+    finally:
+        apply_patch_to_active(original)
+        server.app.state.prover_source = None
+        server.app.state.analysis = None
+
+
+def test_update_source_installs_and_proves_partial_edit(source_editor, partial_code):
+    client, active = source_editor
+    response = client.post('/api/update-source', json={'source_code': partial_code})
+    assert response.status_code == 200
+    body = response.json()
+    assert body['status'] == 'ok'
+    assert body['handler_status']['mode'] == 'patched'
+    assert body['handler_status']['active_code'] == active.read_text(encoding='utf-8') == partial_code
+    assert body['prover_report']['total_cells'] == len(body['prover_report']['cells']) == 27
+    assert 6 < body['prover_report']['passed_cells'] < 27
+    assert client.get('/api/status').json()['prover_report'] == body['prover_report']
+
+
+@pytest.mark.parametrize('source', ['', ' \n\t', '#' * 100_001, '#' + 'é' * 50_000])
+def test_update_source_rejects_empty_and_oversized_code(source_editor, source):
+    client, active = source_editor
+    before = active.read_bytes()
+    response = client.post('/api/update-source', json={'source_code': source})
+    assert response.status_code == 400
+    assert active.read_bytes() == before
+
+
+def test_update_source_syntax_error_preserves_source(source_editor):
+    client, active = source_editor
+    before = active.read_bytes()
+    response = client.post('/api/update-source', json={'source_code': '# edit\ndef broken(\n'})
+    assert response.status_code == 400
+    assert 'Line 2:' in response.json()['detail']
+    assert 'never closed' in response.json()['detail']
+    assert active.read_bytes() == before
+
+
+def test_update_source_import_error_rolls_back(source_editor):
+    client, active = source_editor
+    before = active.read_bytes()
+    status = client.get('/api/status').json()
+    source = "def process_stripe_webhook(*args): pass\nraise ImportError('private-secret /private/path')\n"
+    response = client.post('/api/update-source', json={'source_code': source})
+    assert response.status_code == 400
+    assert 'private-secret' not in response.text and '/private/path' not in response.text
+    assert active.read_bytes() == before
+    restored = client.post('/api/prove').json()
+    assert restored['handler_status'] == status['handler_status']
+    assert restored['prover_report']['passed_cells'] == status['prover_report']['passed_cells']
+
+
+def test_update_source_runtime_error_completes_matrix(source_editor):
+    client, active = source_editor
+    source = "def process_stripe_webhook(session, raw_body, sig_header):\n    raise ValueError('edited runtime failure')\n"
+    response = client.post('/api/update-source', json={'source_code': source})
+    assert response.status_code == 200
+    assert active.read_text(encoding='utf-8') == source
+    report = response.json()['prover_report']
+    assert report['passed_cells'] == 0 and report['failed_cells'] == 27
+    assert len(report['cells']) == 27
+    assert all('ValueError: edited runtime failure' in cell['failure_reason'] for cell in report['cells'])
+
+
+@pytest.mark.parametrize('handler, expected_exit, summary', [
+    ('v2_patched.py', 0, '27 passed'),
+    ('v1_vulnerable.py', 1, '21 failed, 6 passed'),
+])
+def test_exported_pytest_runs_against_isolated_handlers(tmp_path, handler, expected_exit, summary):
+    repo = Path(__file__).resolve().parents[1]
+    active = repo / 'target_app' / 'handlers' / 'active_handler.py'
+    original = active.read_bytes()
+    for package in ('target_app', 'chaoshook_engine'):
+        shutil.copytree(repo / package, tmp_path / package,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    copied_handlers = tmp_path / 'target_app' / 'handlers'
+    shutil.copyfile(copied_handlers / handler, copied_handlers / 'active_handler.py')
+    env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+    exported = subprocess.run(
+        [sys.executable, '-m', 'chaoshook_engine.cli', 'export-pytest',
+         '--out', 'test_webhook_invariance.py'],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert exported.returncode == 0, exported.stdout + exported.stderr
+    from chaoshook_engine.runner import export_pytest_code
+
+    assert (tmp_path / 'test_webhook_invariance.py').read_text(encoding='utf-8') == export_pytest_code()
+    result = subprocess.run(
+        [str(Path(sys.executable).with_name('pytest')), '-q', '--setup-show',
+         'test_webhook_invariance.py'],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == expected_exit, output
+    assert summary in output
+    assert output.count('SETUP    M invariance_report') == 1, output
+    if expected_exit:
+        assert 'test_order_commutativity_all_24_permutations' in output
+        assert 'test_parallel_duplicate_sql_barrier_idempotency' in output
+        assert 'test_mid_handler_crash_retry_atomicity[26]' in output
+        assert 'test_mid_handler_crash_retry_atomicity[27]' in output
+        assert 'expected' in output  # Row-level failure reasons reach pytest assertions.
+    assert active.read_bytes() == original
+
+
+def test_export_pytest_api_is_read_only(monkeypatch):
+    from fastapi.testclient import TestClient
+    from chaoshook_engine import server
+    from chaoshook_engine.patcher import HANDLER_DIR
+    from chaoshook_engine.runner import export_pytest_code
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('export must not run the prover or invoke Muse')
+
+    monkeypatch.setattr(server, 'run_algebraic_prover', unexpected)
+    monkeypatch.setattr(server, 'MuseNeuroSymbolicClient', unexpected)
+    active = HANDLER_DIR / 'active_handler.py'
+    original = active.read_bytes()
+    response = TestClient(server.app).get('/api/export-pytest')
+    assert response.status_code == 200
+    assert response.json() == {
+        'filename': 'test_webhook_invariance.py', 'pytest_code': export_pytest_code(),
+    }
+    assert active.read_bytes() == original
