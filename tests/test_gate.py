@@ -2717,3 +2717,178 @@ def test_duplicate_invoice_v1_lost_ack_after_commit(invoice_audit):
     _invoice_deliver(engine, events[2])
     _invoice_deliver(engine, events[4])
     _invoice_observe(engine, scenario, [events[2], events[4]])
+
+# Source integrity and transactional installation regressions.
+@pytest.mark.parametrize('source', [
+    '# no entry point\n',
+    'def renamed_handler(*args): pass\n',
+    'process_stripe_webhook = 42\n',
+    'def broken(\n',
+    'raise ImportError("staged import failure")\n',
+])
+def test_fresh_install_rejects_invalid_source_without_losing_identity(source_editor, source):
+    from chaoshook_engine import server, patcher
+    client, active = source_editor
+    assert client.post('/api/patch').json()['verified']
+    before = active.read_bytes()
+    module = sys.modules[patcher._MODULE]
+    state = dict(server.app.state._state)
+    result = client.post('/api/update-source', json={'source_code': source})
+    assert result.status_code == 400
+    assert active.read_bytes() == before
+    assert sys.modules[patcher._MODULE] is module
+    assert all(server.app.state._state[key] is value for key, value in state.items())
+    verification = patcher.verify_candidate_patch(source)
+    assert not verification['verified'] and verification['import_error']
+    assert client.post('/api/prove').json()['prover_report']['passed_cells'] == 27
+
+
+def test_repeated_installations_do_not_inherit_helpers_or_imports(source_editor):
+    from chaoshook_engine import patcher
+    client, active = source_editor
+    original = Path(v2_patched.__file__).read_text()
+    first = original + '\nimport math\nOLD_VALUE = 7\ndef old_helper(): return OLD_VALUE\n'
+    assert client.post('/api/patch', json={'patched_code': first}).json()['verified']
+    missing_helper = '''def process_stripe_webhook(session, raw_body, sig_header):
+    return old_helper()
+'''
+    result = client.post('/api/update-source', json={'source_code': missing_helper}).json()
+    assert result['prover_report']['passed_cells'] == 0
+    module = sys.modules[patcher._MODULE]
+    assert not any(name in module.__dict__ for name in ('old_helper', 'OLD_VALUE', 'math', 'User'))
+    assert all('NameError' in c['failure_reason'] for c in result['prover_report']['cells'])
+    for source in (original + '\n# replacement one\n', original):
+        result = client.post('/api/patch', json={'patched_code': source}).json()
+        assert result['verified'] and result['prover_report']['passed_cells'] == 27
+        assert active.read_bytes() == source.encode()
+    env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}
+    result = subprocess.run([sys.executable, '-B', '-c',
+        'from target_app.handlers.active_handler import process_stripe_webhook; '
+        'from chaoshook_engine.runner import run_algebraic_prover; '
+        'assert run_algebraic_prover(process_stripe_webhook)["passed_cells"] == 27'],
+        cwd=active.parents[2], env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize('candidate', ['v1_partial_idempotent.py', 'syntax', 'import'])
+def test_cached_candidate_rejection_preserves_source_module_and_provenance(source_editor, monkeypatch, candidate):
+    from chaoshook_engine import server, patcher
+    client, active = source_editor
+    assert client.post('/api/patch').json()['verified']
+    before = active.read_bytes()
+    module = sys.modules[patcher._MODULE]
+    state = dict(server.app.state._state)
+    source = ('def broken(\n' if candidate == 'syntax' else
+              'raise ImportError("bad cache")\n' if candidate == 'import' else
+              (patcher.HANDLER_DIR / candidate).read_text())
+    reference = patcher.HANDLER_DIR / 'v2_patched.py'
+    read_bytes = Path.read_bytes
+    monkeypatch.setattr(Path, 'read_bytes', lambda path: source.encode() if path == reference else read_bytes(path))
+    result = client.post('/api/patch').json()
+    assert result['status'] == 'rejected' and result['verified'] is False
+    assert result['passed_cells'] == (9 if candidate.endswith('.py') else 0)
+    assert active.read_bytes() == before
+    assert sys.modules[patcher._MODULE] is module
+    assert all(server.app.state._state[key] is value for key, value in state.items())
+
+
+@pytest.mark.parametrize('failure', ['failed_report', 'exception', 'write'])
+def test_post_install_failure_restores_source_module_and_all_server_evidence(source_editor, monkeypatch, reports, failure):
+    from copy import deepcopy
+    from chaoshook_engine import server, patcher
+    client, active = source_editor
+    client.post('/api/reset')
+    client.get('/api/status')
+    before = active.read_bytes()
+    module = sys.modules[patcher._MODULE]
+    state = dict(server.app.state._state)
+    if failure == 'failed_report':
+        monkeypatch.setattr(server, 'run_algebraic_prover', lambda handler: deepcopy(reports['vulnerable']))
+    elif failure == 'exception':
+        def fail(handler):
+            raise RuntimeError('proof infrastructure failed')
+        monkeypatch.setattr(server, 'run_algebraic_prover', fail)
+    else:
+        def fail(path, source):
+            raise OSError('write failed')
+        monkeypatch.setattr(patcher, '_write_source', fail)
+    result = client.post('/api/patch')
+    if failure == 'failed_report':
+        assert result.json()['verified'] is False
+        assert result.json()['status'] == 'rejected'
+    else:
+        assert result.status_code == 400
+        assert result.json().get('verified') is not True
+    assert active.read_bytes() == before
+    assert sys.modules[patcher._MODULE] is module
+    import target_app.handlers as package
+    assert package.active_handler is module
+    assert all(server.app.state._state[key] is value for key, value in state.items())
+
+
+def test_external_comment_only_source_cannot_reuse_cached_proof(source_editor):
+    from chaoshook_engine import server
+    client, active = source_editor
+    assert client.post('/api/patch').json()['verified']
+    before = active.read_bytes()
+    try:
+        active.write_text('# externally removed handler\n')
+        assert client.post('/api/prove').status_code == 400
+        assert client.get('/api/status').status_code == 400
+        assert server.app.state.prover_source != active.read_text()
+    finally:
+        active.write_bytes(before)
+
+
+def test_frontend_requires_complete_patch_success_evidence():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is required for the frontend contract check')
+    root = Path(__file__).resolve().parents[1]
+    script = '''
+import assert from 'node:assert/strict';
+import { isVerifiedPatchResponse } from './ui/src/api.js';
+const report = {passed_cells: 27, total_cells: 27,
+  cells: Array.from({length: 27}, (_, i) => ({id: i + 1, passed: true}))};
+const good = {status: 'ok', verified: true, prover_report: report};
+assert.equal(isVerifiedPatchResponse(good), true);
+for (const result of [null, {}, {...good, verified: false}, {...good, status: 'rejected'},
+  {...good, prover_report: {...report, passed_cells: 9}},
+  {...good, prover_report: {...report, cells: []}},
+  {...good, prover_report: {...report, cells: report.cells.map(c => ({...c, passed: false}))}}]) {
+  assert.equal(isVerifiedPatchResponse(result), false);
+}
+'''
+    result = subprocess.run([node, '--input-type=module', '-e', script], cwd=root,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_cached_source_is_frozen_and_loaded_with_import_metadata(source_editor, monkeypatch):
+    from hashlib import sha256
+    from chaoshook_engine import server, patcher
+    client, active = source_editor
+    reference = patcher.HANDLER_DIR / 'v2_patched.py'
+    source = reference.read_text().replace('from target_app.models import', 'from ..models import')
+    source += '''
+from dataclasses import dataclass
+@dataclass
+class MetadataCheck:
+    value: int = 1
+assert __spec__ is not None and __loader__ is not None and __file__
+'''
+    reads = []
+    original = Path.read_bytes
+    def changing_cache(path):
+        if path != reference:
+            return original(path)
+        reads.append(path)
+        return source.encode() if len(reads) == 1 else b'# cache changed after selection\n'
+    monkeypatch.setattr(Path, 'read_bytes', changing_cache)
+    result = client.post('/api/patch').json()
+    assert result['verified'] and len(reads) == 1
+    assert active.read_bytes() == source.encode()
+    assert result['verification_evidence']['candidate_sha256'] == sha256(source.encode()).hexdigest()
+    assert result['verification_evidence']['provenance'] == 'cached_fallback'
+    assert client.post('/api/prove').json()['prover_report']['passed_cells'] == 27
+    assert client.post('/api/patch', json={'patched_code': source}).json()['verified']

@@ -1,5 +1,6 @@
 """Apply and inspect the hot-swappable target handler."""
 
+from contextlib import contextmanager
 import difflib
 import importlib
 from hashlib import sha256
@@ -17,6 +18,38 @@ _LOCK = RLock()
 _MODULE = "target_app.handlers.active_handler"
 
 
+def _execute_source(code, name, path):
+    """Execute exact UTF-8 source in a new namespace, without bytecode caches.
+
+    The temporary module registration supports decorators and relative imports.
+    This executes trusted local Python; it is not a sandbox.
+    """
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = "target_app.handlers"
+    sys.modules[name] = module
+    try:
+        exec(compile(code, str(path), "exec"), module.__dict__)
+        if not callable(getattr(module, "process_stripe_webhook", None)):
+            raise TypeError("Source must define callable process_stripe_webhook")
+        return module
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+
+
+@contextmanager
+def fresh_handler_module(code):
+    name = f"target_app.handlers._chaoshook_source_{uuid4().hex}"
+    module = _execute_source(code, name, HANDLER_DIR / "active_handler.py")
+    try:
+        yield module
+    finally:
+        # An installed module retains its registration for decorator metadata.
+        if sys.modules.get(_MODULE) is not module:
+            sys.modules.pop(name, None)
+
+
 def verify_candidate_patch(code: str, *, strict_semantic=False) -> dict:
     """Import and prove a candidate outside the repo without installing it."""
     from chaoshook_engine.runner import run_algebraic_prover
@@ -29,13 +62,10 @@ def verify_candidate_patch(code: str, *, strict_semantic=False) -> dict:
     with TemporaryDirectory(prefix="chaoshook-candidate-", dir="/tmp") as directory:
         path = Path(directory) / "candidate.py"
         path.write_text(code, encoding="utf-8")
-        name = f"_chaoshook_candidate_{uuid4().hex}"
+        name = f"target_app.handlers._chaoshook_candidate_{uuid4().hex}"
         try:
-            spec = importlib.util.spec_from_file_location(name, path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
             try:
-                spec.loader.exec_module(module)
+                module = _execute_source(code, name, path)
                 handler = module.process_stripe_webhook
                 if not callable(handler):
                     raise TypeError("process_stripe_webhook must be callable")
@@ -67,51 +97,82 @@ def compute_unified_diff(v1_code: str, v2_code: str) -> str:
 
 def get_active_handler_status() -> dict:
     with _LOCK:
-        code = (HANDLER_DIR / "active_handler.py").read_text(encoding="utf-8")
-        baseline = (HANDLER_DIR / "v1_vulnerable.py").read_text(encoding="utf-8")
+        code = (HANDLER_DIR / "active_handler.py").read_bytes().decode("utf-8")
+        baseline = (HANDLER_DIR / "v1_vulnerable.py").read_bytes().decode("utf-8")
         return {
             "mode": "vulnerable" if code == baseline else "patched",
             "active_code": code, "line_count": len(code.splitlines()),
         }
 
 
-def _install(code: str) -> dict:
+def _write_source(path, source):
+    temporary = None
+    try:
+        with NamedTemporaryFile(mode="wb", dir=path.parent, suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(source)
+        # Remove any old timestamp-based cache before publishing new bytes.
+        Path(importlib.util.cache_from_source(str(path))).unlink(missing_ok=True)
+        temporary.replace(path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def active_installation(code):
+    """Stage a fresh module, publish atomically, and roll back on any exception.
+
+    Callers keep this transaction open through post-install proof and response
+    construction. Rollback restores the original module object, not a reexecution.
+    """
+    import target_app.handlers as package
+
     path = HANDLER_DIR / "active_handler.py"
-    compile(code, str(path), "exec")  # Reject syntax errors before touching the target.
     with _LOCK:
-        previous = path.read_text(encoding="utf-8")
-
-        def write_and_reload(source):
-            temporary = None
+        previous_bytes = path.read_bytes()
+        previous_module = sys.modules.get(_MODULE)
+        missing = object()
+        previous_attribute = getattr(package, "active_handler", missing)
+        with fresh_handler_module(code) as module:
+            published = False
             try:
-                with NamedTemporaryFile(mode="w", encoding="utf-8", dir=HANDLER_DIR,
-                                        suffix=".tmp", delete=False) as stream:
-                    temporary = Path(stream.name)
-                    stream.write(source)
-                temporary.replace(path)
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
-            # Same-second, same-size edits must not reuse stale bytecode.
-            Path(importlib.util.cache_from_source(str(path))).unlink(missing_ok=True)
-            importlib.invalidate_caches()
-            if _MODULE in sys.modules:
-                importlib.reload(sys.modules[_MODULE])
+                _write_source(path, code.encode("utf-8"))
+                published = True
+                sys.modules[_MODULE] = module
+                package.active_handler = module
+                yield get_active_handler_status()
+            except BaseException:
+                try:
+                    if published:
+                        _write_source(path, previous_bytes)
+                finally:
+                    # Restore memory even if the filesystem becomes unwritable.
+                    if previous_module is None:
+                        sys.modules.pop(_MODULE, None)
+                    else:
+                        sys.modules[_MODULE] = previous_module
+                    if previous_attribute is missing:
+                        package.__dict__.pop("active_handler", None)
+                    else:
+                        package.active_handler = previous_attribute
+                raise
             else:
-                importlib.import_module(_MODULE)
+                if (previous_module is not None and previous_module is not module
+                        and previous_module.__name__.startswith("target_app.handlers._chaoshook_source_")):
+                    sys.modules.pop(previous_module.__name__, None)
 
-        try:
-            write_and_reload(code)
-        except Exception:
-            write_and_reload(previous)
-            raise
-        return get_active_handler_status()
+
+def _install(code: str) -> dict:
+    with active_installation(code) as status:
+        return status
 
 
 def apply_patch_to_active(patched_code: str | None = None, *, require_strict_semantic=False) -> dict:
     code = patched_code if patched_code is not None else (
         HANDLER_DIR / "v2_patched.py"
-    ).read_text(encoding="utf-8")
+    ).read_bytes().decode("utf-8")
     if require_strict_semantic:
         evidence = qualify_semantic_candidate(code)
         if not evidence["strict_qualification"]["qualified"]:
@@ -120,7 +181,7 @@ def apply_patch_to_active(patched_code: str | None = None, *, require_strict_sem
 
 
 def reset_active_to_vulnerable() -> dict:
-    return _install((HANDLER_DIR / "v1_vulnerable.py").read_text(encoding="utf-8"))
+    return _install((HANDLER_DIR / "v1_vulnerable.py").read_bytes().decode("utf-8"))
 
 class EvaluationHistory:
     """Caller-maintained provenance for a repair session; retain across candidates.
@@ -161,13 +222,10 @@ def evaluate_candidate_patch(code: str, seeds=(101, 202, 303), *, history=None) 
     with TemporaryDirectory(prefix="chaoshook-evaluation-", dir="/tmp") as directory:
         path = Path(directory) / "candidate.py"
         path.write_text(code, encoding="utf-8")
-        name = f"_chaoshook_evaluation_{uuid4().hex}"
+        name = f"target_app.handlers._chaoshook_evaluation_{uuid4().hex}"
         try:
-            spec = importlib.util.spec_from_file_location(name, path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
             try:
-                spec.loader.exec_module(module)
+                module = _execute_source(code, name, path)
                 handler = module.process_stripe_webhook
                 if not callable(handler):
                     raise TypeError("process_stripe_webhook must be callable")

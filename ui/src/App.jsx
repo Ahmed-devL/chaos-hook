@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Code2, Gauge, LoaderCircle, Play, RotateCcw, Sparkles } from 'lucide-react';
-import { getStatus, prove, diagnose, patch, reset, updateSource } from './api.js';
+import { getStatus, prove, diagnose, patch, reset, updateSource, isVerifiedPatchResponse } from './api.js';
 import ProofMatrixGrid, { VerificationEvidence } from './components/ProofMatrixGrid.jsx';
 import StateDiffInspector from './components/StateDiffInspector.jsx';
 import MuseNeuroSymbolicPanel, { builtInDiagramPng } from './components/MuseNeuroSymbolicPanel.jsx';
@@ -128,7 +128,7 @@ export default function App() {
     return request('patch', async () => {
       setPatchRejection(null);
       const result = await patch(body);
-      if (result.verified === false) {
+      if (!isVerifiedPatchResponse(result)) {
         setPatchRejection(result);
         return;
       }

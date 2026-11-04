@@ -2,7 +2,7 @@
 
 import base64
 import binascii
-import importlib
+from contextlib import contextmanager
 from dataclasses import asdict
 from hashlib import sha256
 import json
@@ -15,12 +15,11 @@ from pydantic import BaseModel
 
 from chaoshook_engine.muse_client import MuseNeuroSymbolicClient, SPARK, WONDER
 from chaoshook_engine.patcher import (
-    HANDLER_DIR, apply_patch_to_active, get_active_handler_status, reset_active_to_vulnerable,
-    verify_candidate_patch,
+    HANDLER_DIR, get_active_handler_status,
+    verify_candidate_patch, active_installation, fresh_handler_module,
 )
 from chaoshook_engine.runner import export_pytest_code, run_algebraic_prover
 from chaoshook_engine.scenario_spec import SCENARIO_SPEC
-from target_app.handlers import active_handler
 
 
 app = FastAPI(title="The Brass Escapement — ChaosHook", version="0.1.0")
@@ -59,14 +58,11 @@ class UpdateSourceRequest(BaseModel):
 def _prove(handler_status: dict, *, force: bool = False) -> dict:
     source = handler_status["active_code"]
     if force or app.state.prover_report is None or app.state.prover_source != source:
-        # Remove timestamp-based bytecode caches, including for edits made outside
-        # the API, before reloading the active module.
-        from pathlib import Path
-
-        Path(importlib.util.cache_from_source(active_handler.__file__)).unlink(missing_ok=True)
-        importlib.invalidate_caches()
-        module = importlib.reload(active_handler)
-        report = run_algebraic_prover(module.process_stripe_webhook)
+        try:
+            with fresh_handler_module(source) as module:
+                report = run_algebraic_prover(module.process_stripe_webhook)
+        except Exception:
+            raise HTTPException(400, "Active source could not be loaded or proved") from None
         app.state.prover_report = report
         app.state.prover_source = source
         app.state.analysis = None
@@ -173,36 +169,74 @@ def diagnose(body: DiagnoseRequest | None = None) -> dict:
         return {**analysis, "proposed_patch_code": analysis["patched_code"]}
 
 
+@contextmanager
+def _source_transaction(code):
+    # Preserve object identities as well as values; failed proofs must not replace
+    # the previously completed proof, analysis, routing, or provenance.
+    previous = dict(app.state._state)
+    try:
+        with active_installation(code) as handler_status:
+            yield handler_status
+    except BaseException:
+        app.state._state.clear()
+        app.state._state.update(previous)
+        raise
+
+
+class _RejectedInstallation(Exception):
+    def __init__(self, report):
+        self.report = report
+
+
 @app.post("/api/patch")
 def patch(body: PatchRequest | None = None) -> dict:
     with _lock:
-        code = body.patched_code if body else None
-        if code is not None:
+        cached = body is None or body.patched_code is None
+        code = ((HANDLER_DIR / "v2_patched.py").read_bytes().decode("utf-8")
+                if cached else body.patched_code)
+        try:
             verification = verify_candidate_patch(code)
-            if not verification["verified"]:
-                if verification["import_error"]:
-                    verification["import_error"] = MuseNeuroSymbolicClient().safe_error(
-                        verification["import_error"])
-                return {"status": "rejected", **verification}
+        except Exception:
+            raise HTTPException(400, "Candidate verification could not complete") from None
+        if not verification["verified"]:
+            if verification["import_error"]:
+                verification["import_error"] = MuseNeuroSymbolicClient().safe_error(verification["import_error"])
+            return {"status": "rejected", **verification}
         selected = (app.state.analysis or {}).get("model_routing", {}).get("selected_candidate") or {}
         try:
-            handler_status = apply_patch_to_active(code)
-        except Exception as exc:
-            # The patcher restores the previous source when installation fails.
-            raise HTTPException(status_code=400, detail="Handler patch could not be loaded") from exc
-        source_hash = sha256(handler_status["active_code"].encode()).hexdigest()
-        provenance = "cached_fallback" if code is None else "prepared"
-        if code is not None and selected.get("candidate_sha256") == source_hash and selected.get("result") == "accepted":
-            provenance = selected["provenance"]
-        app.state.active_provenance = {"candidate_sha256": source_hash, "provenance": provenance}
-        return {**_proof_response(handler_status), "verified": True}
+            with _source_transaction(code) as handler_status:
+                source_hash = sha256(code.encode("utf-8")).hexdigest()
+                provenance = "cached_fallback" if cached else "prepared"
+                if not cached and selected.get("candidate_sha256") == source_hash and selected.get("result") == "accepted":
+                    provenance = selected["provenance"]
+                app.state.active_provenance = {"candidate_sha256": source_hash, "provenance": provenance}
+                response = _proof_response(handler_status)
+                report = response["prover_report"]
+                verified = (report["passed_cells"] == report["total_cells"] == 27
+                            and len(report["cells"]) == 27
+                            and all(c["id"] == index and c["passed"] is True
+                                    for index, c in enumerate(report["cells"], 1)))
+                if not verified:
+                    raise _RejectedInstallation(report)
+                return {**response, "verified": verified}
+        except _RejectedInstallation as exc:
+            report = exc.report
+            return {"status": "rejected", "verified": False,
+                    "candidate_sha256": sha256(code.encode("utf-8")).hexdigest(),
+                    "passed_cells": report["passed_cells"], "total_cells": report["total_cells"],
+                    "failed_cell_ids": [c["id"] for c in report["cells"] if not c["passed"]],
+                    "prover_report": report, "import_error": None}
+        except Exception:
+            raise HTTPException(400, "Handler patch could not be loaded or proved; previous source restored") from None
 
 
 @app.post("/api/reset")
 def reset() -> dict:
     with _lock:
-        app.state.active_provenance = None
-        return _proof_response(reset_active_to_vulnerable())
+        code = (HANDLER_DIR / "v1_vulnerable.py").read_bytes().decode("utf-8")
+        with _source_transaction(code) as handler_status:
+            app.state.active_provenance = None
+            return _proof_response(handler_status)
 
 
 @app.post("/api/update-source")
@@ -220,9 +254,8 @@ def update_source(body: UpdateSourceRequest) -> dict:
         raise HTTPException(400, "Source code could not be compiled") from None
     with _lock:
         try:
-            handler_status = apply_patch_to_active(code)
+            with _source_transaction(code) as handler_status:
+                app.state.active_provenance = None
+                return _proof_response(handler_status)
         except Exception:
-            # Do not expose exception text from user-supplied module execution.
-            raise HTTPException(400, "Handler source could not be loaded; previous source restored") from None
-        app.state.active_provenance = None
-        return _proof_response(handler_status)
+            raise HTTPException(400, "Handler source could not be loaded or proved; previous source restored") from None
