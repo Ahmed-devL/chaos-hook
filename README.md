@@ -578,3 +578,45 @@ These hooks still cover selected SQL INSERT boundaries and commit patterns,
 not every SQLite instruction, savepoint pattern, process/power failure, or
 external email delivery. Side effects use the application's database outbox.
 The correction does not make a missing injection or an incorrect retry pass.
+
+### Invoice business-effect idempotency (v1 regression)
+
+The prepared handler separates delivery deduplication (`webhook_events.event_id`)
+from business-effect deduplication (invoice ID with reason `invoice.paid`). A new
+Event ID is recorded even when its invoice has already received credits. An
+atomic conditional ledger insert grants 100 credits only when it inserts a row;
+the event claim, ledger insertion, and balance update commit together. SQLite's
+writer lock, acquired by the initial event-claim INSERT, serializes competing
+transactions through commit. No schema constraint is added to the shared lab
+schema, preserving the vulnerable and partial controls.
+
+Run the additive `invoice-business-idempotency-v1` regression offline:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_gate.py -k duplicate_invoice
+```
+
+The audit history starts at 853 credits and contains checkout, creation,
+cancellation, and two distinct paid Event IDs for one invoice. All 120 permutations
+are checked at S0 and after each delivery and identical replay: **1,320 complete
+state-and-claim checkpoints**. Every final state has 953 credits, one attributed
+ledger row, and five event claims. Nine additional tests cover concurrent same
+and distinct invoices, three precommit crash boundaries, lost acknowledgment
+after commit, unrelated SQL errors, and both orders of two distinct invoices
+(1053 credits, two ledger rows). Bystander state is checked throughout.
+Together these are 129 isolated histories and 1,341 complete state-and-claim
+checkpoints; synchronization and injection assertions are additional checks.
+
+This coverage is separate from the unchanged **62 schedules / 526 checks** strict
+contract and **27-cell** legacy gate. Existing evidence remains bound to its
+original candidate bytes; historical passing candidates are not thereby certified
+against this new regression. The current prepared source SHA-256 is
+`4bb286df77176632303fb2680332d0c425cfb9973336693d3cdd9b4a272ff019`.
+
+The atomicity argument depends on SQLite's single-writer transactions and this
+claim-first handler. Arbitrary direct ledger writes and other candidate handlers
+are not constrained by a unique index. Existing corrupted databases are not
+reconciled. Invoice IDs are assumed global within the synthetic single Stripe
+account; a multi-account deployment needs provider/account identity in the key.
+This is finite synthetic evidence, not a production database or process/power-loss
+proof. The existing authoritative, distinct timestamp assumptions still apply.

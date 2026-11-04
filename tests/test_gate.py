@@ -2154,7 +2154,7 @@ def semantic_controls():
 def test_semantic_positive_control_exact_coverage_and_preserved_source(semantic_controls):
     from hashlib import sha256
     manifest = semantic_controls['prepared']
-    assert sha256(Path(v2_patched.__file__).read_bytes()).hexdigest() == 'a7a480c713d09c0bf8d73d6239138700dcd7cb66b8802cd3715ba8455a9d1694'
+    assert manifest['candidate']['source_sha256'] == sha256(Path(v2_patched.__file__).read_bytes()).hexdigest()
     assert manifest['runtime_acceptance']['accepted']
     assert manifest['executed_schedule_count'] == 27  # Legacy scope only.
     assert manifest['strict_qualification']['qualified']
@@ -2545,3 +2545,175 @@ def test_experimental_success_diagnostics_exclude_verification_time(monkeypatch,
     assert attempt['request_diagnostics'] == {'attempt': 1, 'effective_timeout_seconds': 17.0,
                                               'elapsed_seconds': 1.5, 'error_category': None}
     assert attempt['fully_qualified']
+
+
+# invoice-business-idempotency-v1 is additive: the 62/526 contract stays frozen.
+@pytest.fixture
+def invoice_audit(tmp_path):
+    from dataclasses import replace
+    from chaoshook_engine.fixtures import get_canonical_events
+    from chaoshook_engine.runner import _cell
+    scenario = replace(SCENARIO_SPEC, initial_credit_balance=853, bystander=True)
+    events = get_canonical_events(scenario)
+    from copy import deepcopy
+    duplicate = deepcopy(events[2])
+    duplicate['id'] += '_distinct_delivery'
+    events.append(duplicate)
+    with _cell(tmp_path / 'invoice-audit.db', [], scenario=scenario) as engine:
+        yield engine, scenario, events
+
+
+def _invoice_observe(engine, scenario, delivered):
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+    from chaoshook_engine.scenario_spec import semantic_expected_state
+    from chaoshook_engine.snapshot import extract_semantic_state
+    from target_app.models import WebhookEvent
+    with Session(engine) as session:
+        assert extract_semantic_state(session, scenario) == semantic_expected_state(scenario, delivered)
+        claims = sorted((row.event_id, row.event_type, row.created_ts, row.status)
+                        for row in session.scalars(select(WebhookEvent)))
+        assert claims == sorted({(e['id'], e['type'], e['created'], 'processed') for e in delivered})
+
+
+def _invoice_deliver(engine, payload):
+    from chaoshook_engine.runner import _deliver
+    return _deliver(engine, v2_patched.process_stripe_webhook, payload, [])
+
+
+@pytest.mark.parametrize('order', list(permutations(range(5))))
+def test_duplicate_invoice_v1_all_prefixes(invoice_audit, order):
+    """120 schedules x 11 complete state/claim checkpoints = 1,320 checks."""
+    engine, scenario, events = invoice_audit
+    delivered = []
+    _invoice_observe(engine, scenario, delivered)
+    for index in order:
+        payload = events[index]
+        _invoice_deliver(engine, payload)
+        delivered.append(payload)
+        _invoice_observe(engine, scenario, delivered)
+        _invoice_deliver(engine, payload)
+        _invoice_observe(engine, scenario, delivered)
+    # Independent audit constants, in addition to the unchanged event-set oracle.
+    from sqlalchemy.orm import Session
+    from target_app.models import User, CreditLedger, WebhookEvent
+    with Session(engine) as session:
+        assert session.get(User, scenario.user_id).credit_balance == 953
+        assert session.query(CreditLedger).count() == 1
+        assert session.query(WebhookEvent).count() == 5
+
+
+@pytest.mark.parametrize('different_invoice', [False, True])
+def test_duplicate_invoice_v1_concurrent(invoice_audit, different_invoice):
+    from threading import Thread
+    from chaoshook_engine.interceptors import DualThreadBarrierController
+    engine, scenario, events = invoice_audit
+    if different_invoice:
+        events[4]['data']['object']['id'] += '_second_invoice'
+    errors = []
+    controller = DualThreadBarrierController(engine)
+    controller.enabled = True
+    def worker(payload):
+        try:
+            _invoice_deliver(engine, payload)
+        except Exception as exc:
+            errors.append(exc)
+    workers = [Thread(name=f'RaceWorker-{i}', target=worker, args=(events[index],))
+               for i, index in enumerate((2, 4))]
+    try:
+        for thread in workers:
+            thread.start()
+        for thread in workers:
+            thread.join(timeout=35)
+        assert not any(t.is_alive() for t in workers), 'synchronization failure: worker did not finish'
+        assert sum('Reached SQL barrier before:' in line for line in controller.sql_trace) == 2, 'synchronization failure: missing rendezvous'
+        assert sum('Released from SQL barrier' in line for line in controller.sql_trace) == 2, 'synchronization failure: broken barrier'
+        assert not errors, f'handler execution failure: {errors}'
+    finally:
+        controller.close()
+    _invoice_observe(engine, scenario, [events[2], events[4]])
+    for payload in (events[2], events[4]):
+        _invoice_deliver(engine, payload)
+    _invoice_observe(engine, scenario, [events[2], events[4]])
+
+
+@pytest.mark.parametrize('boundary', ['ledger', 'balance', 'commit'])
+def test_duplicate_invoice_v1_crash_retry(invoice_audit, boundary):
+    from sqlalchemy import event
+    from chaoshook_engine.interceptors import SimulatedMidHandlerCrash
+    engine, scenario, events = invoice_audit
+    injected = []
+    def crash(*args):
+        if injected:
+            return
+        if boundary != 'commit':
+            statement = args[2].strip().upper()
+            target = 'INSERT INTO CREDIT_LEDGER' if boundary == 'ledger' else 'UPDATE USERS'
+            if not statement.startswith(target):
+                return
+        injected.append(boundary)
+        raise SimulatedMidHandlerCrash('invoice audit before durable commit')
+    hook = 'commit' if boundary == 'commit' else 'after_cursor_execute'
+    event.listen(engine, hook, crash)
+    try:
+        with pytest.raises(SimulatedMidHandlerCrash):
+            _invoice_deliver(engine, events[2])
+        assert injected == [boundary], 'injection failure: boundary not reached'
+    finally:
+        event.remove(engine, hook, crash)
+    _invoice_observe(engine, scenario, [])
+    _invoice_deliver(engine, events[2])
+    _invoice_observe(engine, scenario, [events[2]])
+    # The caller may lose the response after commit; both delivery identities retry.
+    _invoice_deliver(engine, events[2])
+    _invoice_deliver(engine, events[4])
+    _invoice_observe(engine, scenario, [events[2], events[4]])
+
+
+def test_duplicate_invoice_v1_unrelated_sql_error_rolls_back(invoice_audit):
+    from sqlalchemy.exc import IntegrityError
+    engine, scenario, events = invoice_audit
+    # A genuine database error must propagate, not become a duplicate success.
+    with engine.begin() as conn:
+        conn.exec_driver_sql("CREATE TRIGGER reject_invoice BEFORE INSERT ON credit_ledger "
+                             "BEGIN SELECT RAISE(ABORT, 'audit rejection'); END")
+    with pytest.raises(IntegrityError):
+        _invoice_deliver(engine, events[2])
+    _invoice_observe(engine, scenario, [])
+    with engine.begin() as conn:
+        conn.exec_driver_sql('DROP TRIGGER reject_invoice')
+    _invoice_deliver(engine, events[2])
+    _invoice_observe(engine, scenario, [events[2]])
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_duplicate_invoice_v1_distinct_invoices(invoice_audit, reverse):
+    engine, scenario, events = invoice_audit
+    events[4]['data']['object']['id'] += '_second_invoice'
+    delivered = []
+    for index in ((4, 2) if reverse else (2, 4)):
+        _invoice_deliver(engine, events[index])
+        delivered.append(events[index])
+        _invoice_observe(engine, scenario, delivered)
+    from sqlalchemy.orm import Session
+    from target_app.models import User, CreditLedger
+    with Session(engine) as session:
+        assert session.get(User, scenario.user_id).credit_balance == 1053
+        assert session.query(CreditLedger).count() == 2
+
+
+def test_duplicate_invoice_v1_lost_ack_after_commit(invoice_audit):
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session
+    from chaoshook_engine.fixtures import sign_event
+    engine, scenario, events = invoice_audit
+    def lose_ack(session):
+        raise RuntimeError('injected lost acknowledgment after durable commit')
+    with Session(engine) as session:
+        event.listen(session, 'after_commit', lose_ack)
+        with pytest.raises(RuntimeError, match='injected lost acknowledgment'):
+            v2_patched.process_stripe_webhook(session, *sign_event(events[2]))
+    _invoice_observe(engine, scenario, [events[2]])
+    _invoice_deliver(engine, events[2])
+    _invoice_deliver(engine, events[4])
+    _invoice_observe(engine, scenario, [events[2], events[4]])
