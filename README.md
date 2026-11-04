@@ -540,3 +540,41 @@ blocking, prompt separation and comparison accounting. They do not establish
 Muse's live experimental repair capability. Neither verification contract nor
 the prepared reference is changed for this experiment. Bounded public-contract
 success is not general correctness or evidence of held-out generalization.
+
+### Crash-injection ordering correction and request diagnostics
+
+The interceptor now handles both atomic statement orders: event record before
+side effect, and side effect before event record within the same uncommitted
+transaction. In the latter case it injects immediately after the event-record
+INSERT. A pending side effect whose transaction has already reached commit does
+not take this new branch; the existing detection of durable intermediate commits
+is preserved. Missing crash evidence still fails cells 26–27. The runner,
+independent business contracts, candidate handlers, guided prompts and acceptance
+logic are unchanged.
+
+A fresh offline verification of the retained pilot candidate, source SHA-256
+`cb690556eb71dfb954f92ebfa75035b6cc975841bcc328791cf66630b4728f77`,
+now passes **27/27**, including one observed injection, rollback and retry in each
+crash cell, and **526/526 semantic checks across 62 schedules**. Fresh evidence is
+saved separately at `/tmp/chaoshook-pilot-event-last-verification.json`, binding
+the candidate hash, original experiment record hash, and corrected interceptor
+hash. The original `/tmp/chaoshook-contract-pilot/trials.json` was checked byte for
+byte and left unchanged: its first attempt remains recorded as 25/27 and its
+second attempt as ReadTimeout. This offline re-verification does not turn that
+original experiment into a successful live trial or change its success count.
+
+Experimental attempts now carry `request_diagnostics`: `attempt`,
+`effective_timeout_seconds`, `elapsed_seconds`, and `error_category`. Duration
+uses a monotonic clock around the existing API request only, excluding candidate
+verification and evidence persistence. Categories are fixed labels such as
+`read_timeout`, `connect_timeout`, `write_timeout`, `pool_timeout`, `timeout`,
+`transport_error`, or `request_error`; exception messages, credentials, request
+bodies and response content do not enter these diagnostics. Successful requests
+have no error category; configuration-blocked attempts have no measured request
+duration. HTTPX's existing timeout configuration and guided request path are
+unchanged. A timeout is a per-I/O limit, not a total trial deadline.
+
+These hooks still cover selected SQL INSERT boundaries and commit patterns,
+not every SQLite instruction, savepoint pattern, process/power failure, or
+external email delivery. Side effects use the application's database outbox.
+The correction does not make a missing injection or an incorrect retry pass.

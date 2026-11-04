@@ -717,7 +717,10 @@ def run_synthesis_experiment(out, *, trials, synthesis_mode="contract-driven", m
                        "requested_model_identifier": client.safe_error(client.wonder_model),
                        "actual_model_identifier": None, "candidate_sha256": None,
                        "fallback_occurred": False, "base_verification": None,
-                       "strict_semantic": None, "fully_qualified": False}
+                       "strict_semantic": None, "fully_qualified": False,
+                       "request_diagnostics": {"attempt": number,
+                                               "effective_timeout_seconds": client.timeout,
+                                               "elapsed_seconds": None, "error_category": None}}
             trial["attempts"].append(attempt)
             if synthesis_mode == "contract-driven":
                 prompt = CONTRACT_DRIVEN_PROMPT
@@ -752,8 +755,26 @@ def run_synthesis_experiment(out, *, trials, synthesis_mode="contract-driven", m
                         or key in {"none", "null", "changeme", "placeholder", "test", "dummy"}
                         or any(marker in key for marker in ("your_", "your-", "replace", "example", "placeholder", "<", ">"))):
                     attempt["status"] = "configuration_blocked"
+                    attempt["request_diagnostics"]["error_category"] = "configuration_blocked"
                     break
-                response = client.api_request("POST", "chat/completions", json=body)
+                request_started = perf_counter()
+                try:
+                    response = client.api_request("POST", "chat/completions", json=body)
+                except Exception as exc:
+                    # Fixed categories only: never retain exception text, headers,
+                    # endpoint, request body, or response data in diagnostics.
+                    category = next((name for error_type, name in (
+                        (httpx.ReadTimeout, "read_timeout"),
+                        (httpx.ConnectTimeout, "connect_timeout"),
+                        (httpx.WriteTimeout, "write_timeout"),
+                        (httpx.PoolTimeout, "pool_timeout"),
+                        (httpx.TimeoutException, "timeout"),
+                        (httpx.TransportError, "transport_error"),
+                    ) if isinstance(exc, error_type)), "request_error")
+                    attempt["request_diagnostics"]["error_category"] = category
+                    raise
+                finally:
+                    attempt["request_diagnostics"]["elapsed_seconds"] = round(perf_counter() - request_started, 6)
                 attempt["response"] = json.loads(client.safe_error(json.dumps(response)))
                 model = response.get("model")
                 attempt["actual_model_identifier"] = client.safe_error(model) if isinstance(model, str) else None

@@ -88,7 +88,8 @@ class CrashAfterStatementController:
     """Crash once after a selected side effect, respecting real commit boundaries.
 
     A claim-first transaction crashes immediately after the side-effect INSERT.
-    Without a prior claim, arm at INSERT and defer until the first SQL following
+    With an event-last transaction, crash after its later event-record INSERT.
+    Without either ordering, arm at INSERT and defer until the first SQL following
     its commit. Engine 'commit' fires *before* DBAPI commit, so raising there
     would incorrectly roll back v1 as well. No interceptor commits application
     transactions or modifies their data.
@@ -140,6 +141,8 @@ class CrashAfterStatementController:
         table = _insert_table(statement)
         if table == "webhook_events":
             state["claimed"] = True
+            if state.get("pending") and not state.get("committing"):
+                self._crash(conn, f"after {self.target_table} and event-record INSERT inside event-last transaction; rollback expected")
         elif table == self.target_table:
             self.trace_log.append(f"Attempt 1: executed side-effect SQL: {statement.strip()}")
             if state.get("claimed"):

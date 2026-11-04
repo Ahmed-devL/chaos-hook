@@ -2388,3 +2388,160 @@ def test_experiment_cli_count_required_and_recorded_comparison(monkeypatch, tmp_
     assert row['live_trials'] == row['recorded_trials'] == 3
     assert row['live_legacy_successes'] == row['live_fully_qualified_successes'] == 0
     assert 'experiment-secret' not in capsys.readouterr().out
+
+
+def _atomic_event_last_handler(session, raw_body, sig_header):
+    """Generic test control: all effects and the final event record commit together."""
+    from sqlalchemy.exc import IntegrityError
+    from target_app.hmac_auth import verify_stripe_signature
+    from target_app.models import CreditLedger, Subscription, User, WebhookEvent
+    from target_app.schemas import StripeEvent
+    from target_app.side_effects import send_welcome_email
+
+    if not verify_stripe_signature(raw_body, sig_header):
+        raise ValueError('Invalid signature')
+    payload = StripeEvent.model_validate_json(raw_body)
+    if session.get(WebhookEvent, payload.id):
+        return {'status': 'duplicate'}
+    obj = payload.data.object
+    user = session.query(User).filter_by(stripe_customer_id=obj['customer']).one()
+    if payload.type == 'checkout.session.completed':
+        if not user.welcome_email_sent:
+            send_welcome_email(session, user.id, dedupe_key=payload.id)
+            user.welcome_email_sent = 1
+    elif payload.type == 'invoice.paid':
+        session.add(CreditLedger(user_id=user.id, invoice_id=obj['id'], delta=100, reason='invoice.paid'))
+        user.credit_balance += 100
+    else:
+        sub = session.get(Subscription, obj['id'])
+        if sub is None:
+            sub = Subscription(id=obj['id'], user_id=user.id, stripe_customer_id=obj['customer'],
+                               status=obj['status'], current_period_end=0, last_event_ts=0)
+            session.add(sub)
+        sub.current_period_end = max(sub.current_period_end, obj['current_period_end'])
+        if payload.created > sub.last_event_ts:
+            sub.status, sub.last_event_ts = obj['status'], payload.created
+    if payload.type != 'invoice.paid' and payload.created > user.last_event_ts:
+        user.plan_tier = 'canceled' if payload.type.endswith('deleted') else 'pro'
+        user.last_event_ts = payload.created
+    # Explicitly establish event-last order independently of ORM flush ordering.
+    session.flush()
+    session.add(WebhookEvent(event_id=payload.id, event_type=payload.type,
+                             created_ts=payload.created, status='processed'))
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        if session.get(WebhookEvent, payload.id):
+            return {'status': 'duplicate'}
+        raise
+    return {'status': 'processed'}
+
+
+def test_atomic_event_last_actually_injects_and_recovers_both_crashes():
+    report = run_algebraic_prover(_atomic_event_last_handler)
+    assert report['passed_cells'] == 27
+    for cell in report['cells'][25:]:
+        trace = '\n'.join(cell['sql_trace'])
+        assert trace.count('Attempt 1: injecting crash') == 1
+        assert 'inside event-last transaction' in trace
+        assert 'Caught SimulatedMidHandlerCrash' in trace
+        assert 'Attempt 2: replay identical event' in trace
+        assert cell['actual_state'] == report['golden_state']
+        assert cell['property_violations'] == []
+
+
+def test_event_last_broken_retry_fails_despite_real_injection():
+    from chaoshook_engine.interceptors import SimulatedMidHandlerCrash
+    from target_app.schemas import StripeEvent
+    dropped = set()
+    def broken_retry(session, raw_body, sig_header):
+        event_id = StripeEvent.model_validate_json(raw_body).id
+        if event_id in dropped:
+            return {'status': 'duplicate'}  # Deliberately skips rolled-back effects.
+        try:
+            return _atomic_event_last_handler(session, raw_body, sig_header)
+        except SimulatedMidHandlerCrash:
+            dropped.add(event_id)
+            raise
+    report = run_algebraic_prover(broken_retry)
+    for cell, property_name in zip(report['cells'][25:], ('credit_ledger_rows', 'outbox_emails_count')):
+        assert sum('Attempt 1: injecting crash' in line for line in cell['sql_trace']) == 1
+        assert not cell['passed']
+        assert property_name in {v['field'] for v in cell['state_diff']}
+        assert 'execution.errors' not in {v['field'] for v in cell['property_violations']}
+
+
+def test_durable_intermediate_commits_still_inject_and_fail(reports):
+    for cell in reports['vulnerable']['cells'][25:]:
+        assert not cell['passed']
+        assert sum('Attempt 1: injecting crash after committed' in line for line in cell['sql_trace']) == 1
+        assert cell['state_diff']
+        assert not any(v['field'] == 'execution.errors' for v in cell['property_violations'])
+
+
+def test_no_crash_injection_evidence_still_rejects_correct_final_state(monkeypatch):
+    from chaoshook_engine.interceptors import CrashAfterStatementController
+    monkeypatch.setattr(CrashAfterStatementController, '_armed', lambda self: False)
+    report = run_algebraic_prover(_atomic_event_last_handler)
+    assert report['passed_cells'] == 25
+    for cell in report['cells'][25:]:
+        assert not cell['passed'] and cell['state_diff'] == []
+        assert cell['property_violations'] == [{'field': 'execution.errors', 'expected': [],
+                                               'actual': ['Expected mid-handler crash was not injected']}]
+        assert not any('Attempt 1: injecting crash' in line for line in cell['sql_trace'])
+
+
+@pytest.mark.parametrize('exception_name,category', [
+    ('ReadTimeout', 'read_timeout'), ('ConnectTimeout', 'connect_timeout'),
+    ('WriteTimeout', 'write_timeout'), ('PoolTimeout', 'pool_timeout'),
+    ('TimeoutException', 'timeout'), ('ConnectError', 'transport_error'),
+    ('ValueError', 'request_error'),
+])
+def test_experimental_timeout_diagnostics_are_measured_and_sanitized(
+        monkeypatch, tmp_path, semantic_controls, exception_name, category):
+    import httpx
+    from copy import deepcopy
+    from chaoshook_engine import muse_client, patcher
+    _experiment_client(monkeypatch, [])
+    monkeypatch.setenv('MUSE_TIMEOUT_S', '23.5')
+    # Reuse a real baseline report: this test isolates request diagnostics.
+    monkeypatch.setattr(patcher, 'qualify_semantic_candidate', lambda source: deepcopy(semantic_controls['prepared']))
+    clock = iter((100.0, 102.25, 200.0, 204.5))
+    monkeypatch.setattr(muse_client, 'perf_counter', lambda: next(clock))
+    def failing_request(*args, **kwargs):
+        error_type = ValueError if exception_name == 'ValueError' else getattr(httpx, exception_name)
+        raise error_type('experiment-secret Authorization: Bearer private-response')
+    monkeypatch.setattr(muse_client.MuseNeuroSymbolicClient, 'api_request', failing_request)
+    result = muse_client.run_synthesis_experiment(tmp_path / 'timeouts', trials=2, max_attempts=1, run_kind='mocked')
+    for i, trial in enumerate(result['trials'], 1):
+        diagnostic = trial['attempts'][0]['request_diagnostics']
+        assert diagnostic == {'attempt': 1, 'effective_timeout_seconds': 23.5,
+                              'elapsed_seconds': 2.25 if i == 1 else 4.5, 'error_category': category}
+        assert trial['status'] == 'errored'
+        assert not any(token in json.dumps(diagnostic) for token in ('secret', 'Bearer', 'private-response', 'messages'))
+    assert 'private-response' not in json.dumps(result)
+    assert json.loads((tmp_path / 'timeouts/trials.json').read_text()) == result
+
+
+def test_experimental_success_diagnostics_exclude_verification_time(monkeypatch, tmp_path, semantic_controls):
+    from copy import deepcopy
+    from chaoshook_engine import muse_client, patcher
+    _experiment_client(monkeypatch, [Path(v2_patched.__file__).read_text()])
+    monkeypatch.setenv('MUSE_TIMEOUT_S', '17')
+    clock = [10.0]
+    def qualify(source):
+        clock[0] += 50  # Baseline and candidate verification take time too.
+        return deepcopy(semantic_controls['prepared'])
+    monkeypatch.setattr(patcher, 'qualify_semantic_candidate', qualify)
+    monkeypatch.setattr(muse_client, 'perf_counter', lambda: clock[0])
+    original = muse_client.MuseNeuroSymbolicClient.api_request
+    def request(*args, **kwargs):
+        clock[0] += 1.5
+        return original(*args, **kwargs)
+    monkeypatch.setattr(muse_client.MuseNeuroSymbolicClient, 'api_request', request)
+    result = muse_client.run_synthesis_experiment(tmp_path / 'success', trials=1, run_kind='mocked')
+    attempt = result['trials'][0]['attempts'][0]
+    assert attempt['request_diagnostics'] == {'attempt': 1, 'effective_timeout_seconds': 17.0,
+                                              'elapsed_seconds': 1.5, 'error_category': None}
+    assert attempt['fully_qualified']
