@@ -6,7 +6,7 @@ from sqlalchemy import URL, create_engine, event, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from chaoshook_engine.fixtures import SEED_USER
+from chaoshook_engine.scenario_spec import SCENARIO_SPEC
 from target_app.models import CreditLedger, OutboxEmail, Subscription, User
 
 
@@ -31,19 +31,19 @@ def create_cell_engine(db_path: str | Path) -> Engine:
     return engine
 
 
-def seed_initial_state(session: Session) -> None:
+def seed_initial_state(session: Session, scenario=SCENARIO_SPEC) -> None:
     """Persist S0 in a newly created cell before invoking any handler."""
-    session.add(User(**SEED_USER))
+    session.add_all(User(**user) for user in scenario.initial_users())
     session.commit()
 
 
-def extract_comparable_state(session: Session) -> dict:
+def extract_comparable_state(session: Session, scenario=SCENARIO_SPEC) -> dict:
     """Read real database state, excluding delivery order and surrogate row IDs."""
-    user = session.get(User, SEED_USER["id"])
-    sub = session.get(Subscription, "sub_nova_777")
+    user = session.get(User, scenario.user_id)
+    sub = session.get(Subscription, scenario.subscription_id)
     welcome_count = session.scalar(
         select(func.count()).select_from(OutboxEmail).where(
-            OutboxEmail.user_id == SEED_USER["id"],
+            OutboxEmail.user_id == scenario.user_id,
             OutboxEmail.template == "welcome_pro",
         )
     )

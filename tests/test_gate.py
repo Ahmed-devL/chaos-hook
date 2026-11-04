@@ -904,3 +904,126 @@ def test_export_pytest_api_is_read_only(monkeypatch):
         'filename': 'test_webhook_invariance.py', 'pytest_code': export_pytest_code(),
     }
     assert active.read_bytes() == original
+
+
+@pytest.mark.parametrize('seed', [101, 202, 303])
+def test_seeded_reference_contract(seed):
+    from chaoshook_engine.fixtures import scenario_from_seed, get_canonical_events
+
+    scenario = scenario_from_seed(seed)
+    events = get_canonical_events(scenario)
+    report = run_algebraic_prover(v2_patched.process_stripe_webhook, scenario)
+    assert report['passed_cells'] == report['total_cells'] == 27
+    assert report['golden_state']['user']['credit_balance'] == scenario.initial_credit_balance + 100
+    assert scenario.initial_credit_balance > 0
+    assert scenario.customer_id != 'cus_nova_99'
+    assert scenario.subscription_id != 'sub_nova_777'
+    assert events[0]['data']['object']['client_reference_id'] == scenario.user_id
+    assert all(event['data']['object']['customer'] == scenario.customer_id for event in events)
+    assert events[2]['data']['object']['subscription'] == scenario.subscription_id
+    assert all(cell['actual_state'] == scenario.expected_state() for cell in report['cells'])
+
+
+def test_seed_reproduction_and_variation():
+    from chaoshook_engine.fixtures import scenario_from_seed, get_canonical_events
+
+    first, same, other = [scenario_from_seed(seed) for seed in (101, 101, 202)]
+    assert first == same
+    assert get_canonical_events(first) == get_canonical_events(same)
+    for field in ('user_id', 'customer_id', 'subscription_id', 'invoice_id', 'event_ids',
+                  'initial_credit_balance', 'event_timestamps'):
+        assert getattr(first, field) != getattr(other, field)
+    reports = [run_algebraic_prover(v1_vulnerable.process_stripe_webhook, spec)
+               for spec in (first, same)]
+    for report in reports:
+        report.pop('duration_ms')
+        for cell in report['cells']:
+            cell.pop('sql_trace')  # Racing thread trace ordering is intentionally unspecified.
+    assert reports[0] == reports[1]
+
+
+@pytest.mark.parametrize('defect', ['wrong_credit', 'bystander', 'subscription', 'ledger', 'outbox'])
+def test_entity_corruption_rejected_with_matching_aggregates(tmp_path, defect):
+    from sqlalchemy import func, select
+    from sqlalchemy.orm import Session
+    from chaoshook_engine.fixtures import scenario_from_seed, get_canonical_events, sign_event
+    from chaoshook_engine.snapshot import create_cell_engine, seed_initial_state, extract_comparable_state
+    from target_app.models import Base, User, CreditLedger, OutboxEmail, Subscription
+
+    scenario = scenario_from_seed(404)
+    engine = create_cell_engine(tmp_path / 'entity.db')
+    try:
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            seed_initial_state(session, scenario)
+            for event in get_canonical_events(scenario):
+                v2_patched.process_stripe_webhook(session, *sign_event(event))
+            assert scenario.validate(session, extract_comparable_state(session, scenario)) == []
+            user = session.get(User, scenario.user_id)
+            bystander = session.get(User, scenario.initial_users()[1]['id'])
+            total = session.scalar(select(func.sum(User.credit_balance)))
+            if defect == 'wrong_credit':
+                user.credit_balance -= 100
+                bystander.credit_balance += 100
+            elif defect == 'bystander':
+                bystander.email = 'corrupted@example.com'
+            elif defect == 'subscription':
+                session.get(Subscription, scenario.subscription_id).user_id = bystander.id
+            elif defect == 'ledger':
+                session.query(CreditLedger).one().user_id = bystander.id
+            else:
+                session.query(OutboxEmail).one().user_id = bystander.id
+            session.commit()
+            assert session.scalar(select(func.sum(User.credit_balance))) == total
+            violations = scenario.validate(session, extract_comparable_state(session, scenario))
+            assert violations
+            if defect == 'ledger':
+                assert {v['field'] for v in violations} == {'credit_ledger.identity'}
+    finally:
+        engine.dispose()
+
+
+def test_seeded_oracle_never_executes_reference(monkeypatch):
+    from chaoshook_engine.fixtures import scenario_from_seed
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('Independent oracle executed the known repair')
+
+    monkeypatch.setattr(v2_patched, 'process_stripe_webhook', forbidden)
+    scenario = scenario_from_seed(505, bystander=False)
+    expected = scenario.expected_state()
+    assert expected['user']['credit_balance'] == scenario.initial_credit_balance + 100
+    report = run_algebraic_prover(_consistent_handler_without_invoice_credit, scenario)
+    assert report['passed_cells'] == 0
+    assert report['golden_state'] == expected
+
+
+def test_separate_evaluation_provenance_and_retirement():
+    from chaoshook_engine.patcher import EvaluationHistory, evaluate_candidate_patch
+
+    source = Path(v2_patched.__file__).read_text(encoding='utf-8')
+    history = EvaluationHistory(synthesis_seeds=[101], retired_seeds=[202])
+    result = evaluate_candidate_patch(source, [101, 202, 303], history=history)
+    assert result['all_passed']
+    assert [item['label'] for item in result['evaluations']] == ['evaluation', 'evaluation', 'held-out']
+    assert result['schedule_ids'] == list(range(1, 28))
+    assert all(item['prover_report']['total_cells'] == 27 for item in result['evaluations'])
+    history.record_feedback([303])
+    assert 303 in history.retired_seeds
+    rerun = evaluate_candidate_patch(source, [303, 404], history=history)
+    assert [item['label'] for item in rerun['evaluations']] == ['evaluation', 'held-out']
+    assert evaluate_candidate_patch(source, [505])['evaluations'][0]['label'] == 'evaluation'
+    with pytest.raises(ValueError):
+        evaluate_candidate_patch(source, [1, 1])
+
+
+def test_failed_evaluation_is_consumed(partial_code):
+    from chaoshook_engine.patcher import EvaluationHistory, evaluate_candidate_patch
+
+    history = EvaluationHistory()
+    result = evaluate_candidate_patch(partial_code, [606], history=history)
+    assert not result['all_passed']
+    assert result['evaluations'][0]['label'] == 'held-out'
+    history.record_feedback([606])
+    result = evaluate_candidate_patch(partial_code, [606, 707], history=history)
+    assert [item['label'] for item in result['evaluations']] == ['evaluation', 'held-out']

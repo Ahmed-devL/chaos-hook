@@ -111,7 +111,33 @@ def main(argv=None) -> int:
     commands.add_parser("live-patch-check", help="Prove a live Wonder patch without installing it")
     export = commands.add_parser("export-pytest", help="Export the 27-cell pytest regression suite")
     export.add_argument("--out", type=Path, default=Path("test_webhook_invariance.py"))
+    evaluate = commands.add_parser("evaluate", help="Evaluate source on seeded scenarios, without Muse")
+    evaluate.add_argument("--source", type=Path, required=True)
+    evaluate.add_argument("--seed", type=int, action="append", dest="seeds")
+    evaluate.add_argument("--history", type=Path,
+                          help="JSON history with used_seeds and retired_seeds; updated before returning")
     args = parser.parse_args(argv)
+    if args.command == "evaluate":
+        import json
+        from chaoshook_engine.patcher import EvaluationHistory, evaluate_candidate_patch
+
+        history = None
+        if args.history:
+            # Require an existing explicit provenance record; never assume a fresh history.
+            data = json.loads(args.history.read_text(encoding="utf-8"))
+            history = EvaluationHistory(data["used_seeds"], retired_seeds=data["retired_seeds"])
+        source = args.source.read_text(encoding="utf-8")
+        seeds = args.seeds or (101, 202, 303)
+        if len(set(seeds)) != len(seeds):
+            parser.error("Evaluation seeds must be distinct")
+        if history is not None:
+            # Reserve durably before running; interruption must not reuse a label.
+            args.history.write_text(json.dumps({"used_seeds": sorted(history.used_seeds | set(seeds)),
+                                               "retired_seeds": sorted(history.retired_seeds)}) + "\n",
+                                    encoding="utf-8")
+        result = evaluate_candidate_patch(source, seeds, history=history)
+        print(json.dumps(result, indent=2))
+        return 0 if result["all_passed"] else 1
     if args.command == "export-pytest":
         args.out.write_text(export_pytest_code(), encoding="utf-8")
         print(f"Exported pytest suite to {args.out}")

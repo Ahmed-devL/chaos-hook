@@ -107,3 +107,73 @@ def apply_patch_to_active(patched_code: str | None = None) -> dict:
 
 def reset_active_to_vulnerable() -> dict:
     return _install((HANDLER_DIR / "v1_vulnerable.py").read_text(encoding="utf-8"))
+
+class EvaluationHistory:
+    """Caller-maintained provenance for a repair session; retain across candidates.
+
+    Only construct this with the complete set of synthesis/selection input seeds.
+    Evaluation consumes seeds immediately, so selecting or repairing a candidate
+    using a result cannot cause that input to be labeled held-out again.
+    """
+
+    def __init__(self, synthesis_seeds=(), *, retired_seeds=()):
+        self.used_seeds = set(synthesis_seeds)
+        self.retired_seeds = set(retired_seeds)
+
+    def record_feedback(self, seeds):
+        self.used_seeds.update(seeds)
+        self.retired_seeds.update(seeds)
+
+
+def evaluate_candidate_patch(code: str, seeds=(101, 202, 303), *, history=None) -> dict:
+    """Evaluate frozen source separately from synthesis and legacy acceptance.
+
+    No history means unknown provenance and results are labeled ``evaluation``.
+    A complete caller-supplied history permits held-out labeling for fresh seeds.
+    Never feed this report into Muse; retire feedback inputs with record_feedback.
+    """
+    from dataclasses import asdict
+    from hashlib import sha256
+    from chaoshook_engine.fixtures import scenario_from_seed
+    from chaoshook_engine.runner import run_algebraic_prover
+
+    seeds = tuple(seeds)
+    if not seeds or any(type(seed) is not int for seed in seeds) or len(set(seeds)) != len(seeds):
+        raise ValueError("Provide a nonempty collection of distinct integer seeds")
+    result = {"candidate_sha256": sha256(code.encode()).hexdigest(),
+              "evaluations": [], "all_passed": False, "import_error": None,
+              "schedule_ids": list(range(1, 28)),
+              "coverage": "24 permutations, one SQL barrier race, two crash retries per seed"}
+    with TemporaryDirectory(prefix="chaoshook-evaluation-", dir="/tmp") as directory:
+        path = Path(directory) / "candidate.py"
+        path.write_text(code, encoding="utf-8")
+        name = f"_chaoshook_evaluation_{uuid4().hex}"
+        try:
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+                handler = module.process_stripe_webhook
+                if not callable(handler):
+                    raise TypeError("process_stripe_webhook must be callable")
+            except Exception as exc:
+                result["import_error"] = f"{type(exc).__name__}: {exc}"
+                return result
+            for seed in seeds:
+                held_out = history is not None and seed not in (history.used_seeds | history.retired_seeds)
+                if history is not None:
+                    # Consume before execution, including failed evaluations.
+                    history.used_seeds.add(seed)
+                scenario = scenario_from_seed(seed)
+                report = run_algebraic_prover(handler, scenario)
+                result["evaluations"].append({
+                    "seed": seed, "label": "held-out" if held_out else "evaluation",
+                    "scenario": asdict(scenario), "prover_report": report,
+                })
+            result["all_passed"] = all(
+                item["prover_report"]["passed_cells"] == 27 for item in result["evaluations"]
+            )
+            return result
+        finally:
+            sys.modules.pop(name, None)

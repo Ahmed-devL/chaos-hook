@@ -66,7 +66,7 @@ def test_mid_handler_crash_retry_atomicity(invariance_report, cell_id):
 
 
 @contextmanager
-def _cell(path, trace, seed=None, engine=None):
+def _cell(path, trace, seed=None, engine=None, scenario=SCENARIO_SPEC):
     if seed is not None:
         # Copy S0, including schema, into an independent on-disk database.
         destination = sqlite3.connect(path)
@@ -88,7 +88,7 @@ def _cell(path, trace, seed=None, engine=None):
         if seed is None:
             Base.metadata.create_all(engine)
             with Session(engine) as session:
-                seed_initial_state(session)
+                seed_initial_state(session, scenario)
 
         def record(conn, cursor, statement, parameters, context, executemany):
             trace.append(
@@ -151,10 +151,10 @@ def _failure_tag(category, sequence, differences, errors):
     return "STALE_PLAN_OVERWRITE"
 
 
-def _report_cell(engine, cell_id, category, label, sequence, trace, errors):
+def _report_cell(engine, cell_id, category, label, sequence, trace, errors, scenario):
     with Session(engine) as session:
-        actual = extract_comparable_state(session)
-        violations = SCENARIO_SPEC.validate(session, actual, errors)
+        actual = extract_comparable_state(session, scenario)
+        violations = scenario.validate(session, actual, errors)
     differences = [item for item in violations if item["field"] != "execution.errors"]
     reasons = [
         f"{item['field']}: expected {item['expected']!r}, got {item['actual']!r}"
@@ -170,16 +170,16 @@ def _report_cell(engine, cell_id, category, label, sequence, trace, errors):
     }
 
 
-def run_algebraic_prover(handler_fn) -> dict:
+def run_algebraic_prover(handler_fn, scenario=SCENARIO_SPEC) -> dict:
     """Check the independent scenario contract across 27 isolated schedules."""
     started = perf_counter()
-    payloads = get_canonical_events()
-    golden = SCENARIO_SPEC.expected_state()
+    payloads = get_canonical_events(scenario)
+    golden = scenario.expected_state()
     cells = []
     with TemporaryDirectory(prefix="chaoshook-") as folder, closing(sqlite3.connect(":memory:")) as seed:
         root = Path(folder)
         engine = create_cell_engine(root / "seed.db")
-        with _cell(root / "seed.db", [], engine=engine) as engine:
+        with _cell(root / "seed.db", [], engine=engine, scenario=scenario) as engine:
             raw = engine.raw_connection()
             try:
                 raw.driver_connection.backup(seed)
@@ -194,7 +194,7 @@ def run_algebraic_prover(handler_fn) -> dict:
                     _safe_delivery(engine, handler_fn, payloads[index], trace, errors)
                 cells.append(_report_cell(
                     engine, cell_id, "permutation", " → ".join(sequence),
-                    sequence, trace, errors,
+                    sequence, trace, errors, scenario,
                 ))
 
         trace, errors = [], []
@@ -221,7 +221,7 @@ def run_algebraic_prover(handler_fn) -> dict:
             cells.append(_report_cell(
                 engine, 25, "concurrency", "2-Thread SQL Barrier TOCTOU Race",
                 ["e1", "e2", "e3 (RaceWorker-A)", "e3 (RaceWorker-B)", "e4"],
-                trace, errors,
+                trace, errors, scenario,
             ))
 
         for cell_id, index, table, label in (
@@ -255,7 +255,7 @@ def run_algebraic_prover(handler_fn) -> dict:
                 for payload in payloads[index + 1:]:
                     _safe_delivery(engine, handler_fn, payload, trace, errors)
                 cells.append(_report_cell(
-                    engine, cell_id, "crash_retry", label, sequence, trace, errors,
+                    engine, cell_id, "crash_retry", label, sequence, trace, errors, scenario,
                 ))
 
     passed = sum(cell["passed"] for cell in cells)
