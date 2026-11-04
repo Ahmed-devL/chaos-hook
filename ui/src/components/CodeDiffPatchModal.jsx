@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { LoaderCircle } from 'lucide-react';
+import { candidateSource } from './ProofMatrixGrid.jsx';
 
 function rejectionExplanation(rejection) {
   if (rejection.import_error) return 'The candidate could not be imported.';
@@ -42,7 +43,7 @@ export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, o
           <h2 id="patch-title" className="text-xl font-semibold text-brass">Atomic Patch · Unified Diff</h2>
           <button type="button" onClick={onClose} className="rounded border border-slate-600 px-4 py-2 hover:bg-slate-800">Close</button>
         </header>
-        <p className="mb-3 text-sm text-brass">Patch source: {analysis?.model_routing?.wonder_live ? 'LIVE Muse Wonder' : 'Verified cache'}</p>
+        <p className="mb-3 text-sm text-brass">Patch source: {candidateSource(analysis?.model_routing?.candidate_attempts?.at(-1)?.provenance)}</p>
         {!!analysis?.model_routing?.cegis_rounds?.length && <p className="mb-3 text-sm text-slate-300">
           {analysis.model_routing.cegis_rounds.map((round) => `Round ${round.round}: ${round.passed_cells}/27`).join(' → ')}
         </p>}
@@ -71,7 +72,7 @@ export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, o
           </div>
           {rejection && <button type="button" onClick={onApplyCached} disabled={applying}
             className="mt-3 rounded border border-brass px-4 py-2 text-sm text-brass hover:bg-brass/10 disabled:opacity-60">
-            Apply verified cached patch instead
+            Apply cached patch instead
           </button>}
           {applying && <p role="status" className="mt-2 text-sm text-brass">Running all 27 proof cells…</p>}
         </footer>

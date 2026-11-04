@@ -145,6 +145,22 @@ function ScheduleDiagram({ cell }) {
   </figure>;
 }
 
+function explainDiscrepancy(cell) {
+  const diff = cell.state_diff.find((entry) => entry.field === 'user.credit_balance') ?? cell.state_diff[0];
+  if (!diff) return cell.passed ? 'This schedule reached the required business state.' : 'No terminal state difference was recorded. Execution or scheduling requirements failed; this check did not pass.';
+  if (diff.field === 'user.credit_balance') return `The account ended with ${format(diff.actual)} credits; the contract requires ${format(diff.expected)}. The balance is incorrect for this customer.`;
+  const labels = {
+    'subscription.status': 'The subscription status', 'user.plan_tier': 'The account plan',
+    'user.welcome_email_count': 'The number of welcome messages for this account',
+    'outbox_emails_count': 'The total number of queued emails',
+    'credit_ledger_rows': 'The number of credit ledger entries',
+    'credit_ledger_sum': 'The credits recorded in the ledger',
+    'credit_ledger.identity': 'The credit recipient or invoice',
+    'outbox_emails.identity': 'The email recipient or template',
+  };
+  return `${labels[diff.field] ?? diff.field} should be ${format(diff.expected)}, but was ${format(diff.actual)}.`;
+}
+
 export default function StateDiffInspector({ cell, goldenState }) {
   if (!cell) {
     return <section className="rounded-lg border border-slate-800 bg-slate-900 p-5">Select a cell to inspect its state and trace.</section>;
@@ -163,6 +179,8 @@ export default function StateDiffInspector({ cell, goldenState }) {
         <p className="break-words font-mono text-sm leading-relaxed text-slate-300">{cell.sequence.join(' → ')}</p>
         {!cell.passed && <p className="break-words font-mono text-sm text-crimson">{cell.failure_tag}</p>}
       </header>
+
+      <p className="mb-4 rounded border border-slate-700 bg-slate-950 p-3 text-sm leading-relaxed text-slate-200">{explainDiscrepancy(cell)}</p>
 
       {cell.passed ? (
         <p role="status" className="rounded border border-emerald/40 bg-emerald/10 p-4 font-medium text-emerald">State matches S*</p>
@@ -199,6 +217,8 @@ export default function StateDiffInspector({ cell, goldenState }) {
         </div>
       )}
 
+      <details key={cell.id} className="mt-5">
+        <summary className="cursor-pointer text-sm text-brass">View schedule and full SQL trace</summary>
       <ScheduleDiagram cell={cell} />
 
       <section aria-labelledby="trace-heading" className="mt-8">
@@ -216,6 +236,7 @@ export default function StateDiffInspector({ cell, goldenState }) {
           </ol>
         )}
       </section>
+      </details>
     </section>
   );
 }

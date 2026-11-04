@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Code2, Gauge, LoaderCircle, Play, RotateCcw, Sparkles } from 'lucide-react';
 import { getStatus, prove, diagnose, patch, reset, updateSource } from './api.js';
-import ProofMatrixGrid from './components/ProofMatrixGrid.jsx';
+import ProofMatrixGrid, { VerificationEvidence } from './components/ProofMatrixGrid.jsx';
 import StateDiffInspector from './components/StateDiffInspector.jsx';
 import MuseNeuroSymbolicPanel, { builtInDiagramPng } from './components/MuseNeuroSymbolicPanel.jsx';
 import CodeDiffPatchModal from './components/CodeDiffPatchModal.jsx';
@@ -27,6 +27,8 @@ export default function App() {
   const [editError, setEditError] = useState(null);
   const gutterRef = useRef(null);
   const [report, setReport] = useState(null);
+  const [evidence, setEvidence] = useState(null);
+  const [candidateAudit, setCandidateAudit] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [analysis, setAnalysis] = useState(null);
   const [patchOpen, setPatchOpen] = useState(false);
@@ -62,8 +64,10 @@ export default function App() {
     }
   }
 
-  function displayReport(nextReport) {
+  function displayReport(result) {
+    const nextReport = result.prover_report;
     setReport(nextReport);
+    setEvidence(result.verification_evidence ?? null);
     setSelectedId(defaultCell(nextReport.cells));
     setAnalysis(null);
     setInspectorTab('state');
@@ -73,7 +77,7 @@ export default function App() {
     request('load', async () => {
       setStatus(await getStatus());
       const result = await prove();
-      displayReport(result.prover_report);
+      displayReport(result);
     });
   }, []);
 
@@ -99,7 +103,7 @@ export default function App() {
   function runProver() {
     return request('prove', async () => {
       const result = await prove();
-      displayReport(result.prover_report);
+      displayReport(result);
       setStatus(await getStatus());
     });
   }
@@ -109,7 +113,9 @@ export default function App() {
     setPatchRejection(null);
     return request('diagnose', async () => {
       const image = sendDiagram ? diagramImage ?? await builtInDiagramPng() : null;
-      setAnalysis(await diagnose({ use_cache: instantMode, diagram_image: image }));
+      const result = await diagnose({ use_cache: instantMode, diagram_image: image });
+      setAnalysis(result);
+      setCandidateAudit(result.model_routing);
     });
   }
 
@@ -126,7 +132,7 @@ export default function App() {
         setPatchRejection(result);
         return;
       }
-      displayReport(result.prover_report);
+      displayReport(result);
       setStatus(await getStatus());
       setPatchOpen(false);
     });
@@ -135,7 +141,9 @@ export default function App() {
   function resetBaseline() {
     return request('reset', async () => {
       const result = await reset();
-      displayReport(result.prover_report);
+      displayReport(result);
+      setCandidateAudit(null);
+      setPatchRejection(null);
       setStatus(await getStatus());
       setPatchOpen(false);
       setEditing(false);
@@ -148,7 +156,8 @@ export default function App() {
       setEditError(null);
       try {
         const result = await updateSource(draft);
-        displayReport(result.prover_report);
+        displayReport(result);
+        setCandidateAudit(null);
         setStatus((previous) => ({ ...previous, ...result.handler_status }));
       } catch (cause) {
         setEditError(cause instanceof Error ? cause.message : String(cause));
@@ -175,9 +184,9 @@ export default function App() {
             </div>
           </div>
           <div className="space-y-3 sm:text-right">
-            <p ref={scoreRef} role="status" aria-label="Algebraic proof score"
+            <p ref={scoreRef} role="status" aria-label="Configured verification check score"
               className={`max-w-3xl rounded-lg border px-4 py-3 font-mono text-xs font-semibold leading-relaxed tracking-wide transition-colors duration-700 motion-reduce:transition-none sm:text-sm ${report ? invariant ? 'border-emerald/50 bg-emerald/10 text-emerald shadow-lg shadow-emerald/5' : 'border-crimson/50 bg-crimson/10 text-crimson' : 'border-slate-700 text-slate-400'}`}>
-              {report ? `${report.passed_cells} / ${report.total_cells} CELLS VERIFIED - ${invariant ? 'ALGEBRAICALLY INVARIANT' : 'COMMUTATIVITY & IDEMPOTENCY VIOLATED'}` : 'AWAITING 27-CELL PROOF'}
+              {report ? `${report.passed_cells} / ${report.total_cells} CELLS VERIFIED - ${invariant ? `All ${report.total_cells} configured checks passed` : 'Configured checks failed'}` : 'AWAITING 27-CELL PROOF'}
             </p>
             <div className="flex flex-wrap items-center gap-3 sm:justify-end">
               <span className="font-mono text-xs tabular-nums text-slate-400">Execution time: {report ? `${report.duration_ms.toFixed(3)} ms` : '—'}</span>
@@ -200,10 +209,12 @@ export default function App() {
             </div>
           ))}
         </nav>
-        {busy && <p role="status" className="mt-3 flex items-center gap-2 text-xs text-brass"><LoaderCircle size={14} aria-hidden="true" className="animate-spin" />{pending === 'diagnose' ? `${instantMode ? 'Loading verified cached analysis' : 'Muse Wonder + Spark 1.3 running live (typically 2–3 minutes) (Muse Wonder reasons through the repair before answering)'} · ${diagnosisSeconds}s elapsed` : pending === 'load' ? 'Reading active handler and running all 27 proof cells…' : 'Instrument running · awaiting backend result…'}</p>}
+        {busy && <p role="status" className="mt-3 flex items-center gap-2 text-xs text-brass"><LoaderCircle size={14} aria-hidden="true" className="animate-spin" />{pending === 'diagnose' ? `${instantMode ? 'Loading verified cached analysis' : 'Requesting Muse analysis (typically 2–3 minutes; fallback may be used)'} · ${diagnosisSeconds}s elapsed` : pending === 'load' ? 'Reading active handler and running all 27 proof cells…' : 'Instrument running · awaiting backend result…'}</p>}
       </header>
 
       {error && <div role="alert" className="mx-auto mb-6 max-w-[2400px] whitespace-pre-wrap break-words rounded-lg border border-crimson/50 bg-crimson/10 p-4 text-sm text-crimson">{error}</div>}
+
+      <VerificationEvidence report={report} evidence={evidence} audit={candidateAudit} busy={busy} />
 
       <div className="mx-auto grid max-w-[2400px] items-start gap-5 xl:grid-cols-[minmax(0,0.8fr)_minmax(0,1.3fr)_minmax(0,1fr)]">
         <section aria-labelledby="code-heading" className="min-w-0 rounded-lg border border-slate-800 bg-slate-900">
@@ -230,14 +241,14 @@ export default function App() {
               <button type="button" disabled={busy} onClick={saveEdit} className="rounded border border-brass px-3 py-2 text-xs text-brass disabled:opacity-50">Save Edit &amp; Run 27-Cell Prover</button>
               <button type="button" disabled={busy || !status?.partial_patch_code} onClick={() => { setDraft(status.partial_patch_code); setEditError(null); }} className="rounded border border-slate-700 px-3 py-2 text-xs text-slate-300 disabled:opacity-50">Load naive partial patch</button>
             </div>
-          </> : <div role="region" aria-label="Active handler source" tabIndex={0} className="max-h-[65vh] overflow-auto bg-slate-950 py-4 font-mono text-xs leading-6">
+          </> : <details><summary className="cursor-pointer px-5 py-3 text-xs text-brass">View active handler source</summary><div role="region" aria-label="Active handler source" tabIndex={0} className="max-h-[65vh] overflow-auto bg-slate-950 py-4 font-mono text-xs leading-6">
             {status ? status.active_code.split('\n').map((line, index) => (
               <div key={index} className="flex min-w-max pr-5 hover:bg-slate-900">
                 <span aria-hidden="true" className="sticky left-0 mr-4 w-12 shrink-0 select-none border-r border-slate-800 bg-slate-950 pr-3 text-right tabular-nums text-slate-500">{index + 1}</span>
                 <code className="whitespace-pre text-slate-300">{line || ' '}</code>
               </div>
             )) : <p className="px-5 text-slate-500">Waiting for active handler source…</p>}
-          </div>}
+          </div></details>}
         </section>
 
         <div className="min-w-0">

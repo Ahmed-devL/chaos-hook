@@ -3,7 +3,7 @@
 from sqlalchemy import text
 
 from target_app.hmac_auth import verify_stripe_signature
-from target_app.models import CreditLedger, Subscription, User
+from target_app.models import Subscription, User
 from target_app.schemas import StripeEvent
 from target_app.side_effects import send_welcome_email
 
@@ -66,10 +66,18 @@ def process_stripe_webhook(session, raw_body: bytes, sig_header: str) -> dict:
                 user.plan_tier = "canceled" if status == "canceled" else "pro"
                 user.last_event_ts = event_ts
         elif event.type == "invoice.paid":
-            session.add(CreditLedger(
-                user_id=user.id, invoice_id=obj["id"], delta=100,
-                reason="invoice.paid",
-            ))
-            user.credit_balance = User.credit_balance + 100
+            # Business identity is separate from delivery identity. The claim
+            # INSERT above holds SQLite's writer lock until this transaction
+            # ends. This conditional INSERT is therefore atomic across workers;
+            # no competing claim can write between its predicate and commit.
+            # Invoice IDs are global in this single-provider/account model.
+            grant = session.execute(text(
+                "INSERT INTO credit_ledger (user_id, invoice_id, delta, reason) "
+                "SELECT :user_id, :invoice_id, 100, 'invoice.paid' "
+                "WHERE NOT EXISTS (SELECT 1 FROM credit_ledger "
+                "WHERE invoice_id = :invoice_id AND reason = 'invoice.paid')"
+            ), {"user_id": user.id, "invoice_id": obj["id"]})
+            if grant.rowcount == 1:
+                user.credit_balance = User.credit_balance + 100
 
     return {"status": "processed", "event_id": event.id}
