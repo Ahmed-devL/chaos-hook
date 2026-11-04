@@ -33,7 +33,7 @@ import sys
 import pytest
 
 # Support plain pytest when this file is saved at the repo root or under tests/.
-for root in Path(__file__).resolve().parents:
+for root in (*Path(__file__).resolve().parents, Path.cwd(), *Path.cwd().parents):
     if (root / "target_app").is_dir() and (root / "chaoshook_engine").is_dir():
         sys.path.insert(0, str(root))
         break
@@ -132,8 +132,15 @@ def _safe_delivery(engine, handler, payload, trace, errors):
 
 
 def _failure_tag(category, sequence, differences, errors):
+    if category == "concurrency" and any(
+        item["field"] == "credit_ledger_rows" and (item["actual"] or 0) > (item["expected"] or 0)
+        for item in differences
+    ):
+        return "DOUBLE_CREDIT_RACE"
+    if errors:
+        return "HANDLER_ERROR"
     if not differences:
-        return "HANDLER_ERROR" if errors else None
+        return None
     fields = {item["field"] for item in differences}
     if category == "concurrency":
         return "DOUBLE_CREDIT_RACE"

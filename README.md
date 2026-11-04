@@ -41,7 +41,7 @@ flowchart TD
 ```
 
 CEGIS means counterexample-guided inductive synthesis: a rejected candidate's remaining failures and import error become feedback for the next synthesis attempt.
-Wonder receives the SQLAlchemy schema, active handler, interface contract, and compact counterexamples; the live request contains no reference implementation.
+Wonder receives high-level design requirements in its system prompt (single-transaction ON CONFLICT claim, tombstones, monotonic watermarks, no intermediate commits) alongside the schema, the active handler, an interface contract, and compact counterexamples. It receives no reference code.
 There are at most two synthesis rounds, with a 240-second budget heuristic that can skip round 2.
 Wonder synthesis and Spark diagnosis run concurrently during live analysis.
 

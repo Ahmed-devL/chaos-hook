@@ -35,6 +35,9 @@ def test_vulnerable_baseline(reports):
         assert not cell["passed"]
         assert cell["state_diff"]
     race, credits, emails = report["cells"][24:]
+    assert race["failure_tag"] == "DOUBLE_CREDIT_RACE"
+    assert credits["failure_tag"] == "DOUBLE_CREDIT_RETRY"
+    assert emails["failure_tag"] == "DUPLICATE_WELCOME_EMAIL"
     for cell in (race, credits):
         assert cell["actual_state"]["user"]["credit_balance"] == 200
         assert cell["actual_state"]["credit_ledger_rows"] == 2
@@ -93,6 +96,7 @@ def test_unexpected_handler_errors_complete_matrix(reports):
     assert len(report["cells"]) == 27
     for cell in report["cells"]:
         assert "ValueError: deliberate handler failure" in cell["failure_reason"]
+        assert cell["failure_tag"] == "HANDLER_ERROR"
         assert cell["state_diff"]
     for cell in report["cells"][25:]:
         assert "Expected mid-handler crash was not injected" in cell["failure_reason"]
