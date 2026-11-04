@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { LoaderCircle } from 'lucide-react';
-import { candidateSource } from './ProofMatrixGrid.jsx';
+import { candidateSource, shortHash } from './ProofMatrixGrid.jsx';
 
 function rejectionExplanation(rejection) {
   if (rejection.authentication_admission?.passed === false && !rejection.import_error) {
@@ -12,7 +12,7 @@ function rejectionExplanation(rejection) {
   if (failed.some((id) => id >= 1 && id <= 24)) categories.push('event ordering');
   if (failed.includes(25)) categories.push('concurrent duplicate delivery');
   if (failed.some((id) => id === 26 || id === 27)) categories.push('crash recovery');
-  return categories.length ? `Remaining failures: ${categories.join(', ')}.` : 'See prover evidence for details.';
+  return categories.length ? `Remaining failures: ${categories.join(', ')}. The previous handler remains installed.` : 'Installation was not confirmed. Complete acceptance evidence is required.';
 }
 
 function lineStyle(line) {
@@ -23,7 +23,7 @@ function lineStyle(line) {
   return 'text-slate-300';
 }
 
-export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, onApplyCached, partialPatchCode, rejection, applying }) {
+export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, onApplyCached, partialPatchCode, rejection, error, applying }) {
   const dialogRef = useRef(null);
 
   useEffect(() => {
@@ -38,49 +38,35 @@ export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, o
     };
   }, [open]);
 
-  return (
-    <dialog ref={dialogRef} aria-labelledby="patch-title" onCancel={(event) => { event.preventDefault(); onClose(); }}
-      className="fixed inset-0 m-0 h-screen max-h-none w-screen max-w-none bg-slate-950/95 p-4 text-slate-100 backdrop:bg-black/70 sm:p-8">
-      <div className="mx-auto flex h-full max-w-6xl flex-col rounded-lg border border-slate-700 bg-slate-900 p-5">
-        <header className="mb-4 flex flex-wrap items-center justify-between gap-3">
-          <h2 id="patch-title" className="text-xl font-semibold text-brass">Atomic Patch · Unified Diff</h2>
-          <button type="button" onClick={onClose} className="rounded border border-slate-600 px-4 py-2 hover:bg-slate-800">Close</button>
-        </header>
-        <p className="mb-3 text-sm text-brass">Patch source: {candidateSource(analysis?.model_routing?.candidate_attempts?.at(-1)?.provenance)}</p>
-        {!!analysis?.model_routing?.cegis_rounds?.length && <p className="mb-3 text-sm text-slate-300">
-          {analysis.model_routing.cegis_rounds.map((round) => `Round ${round.round}: ${round.passed_cells}/27`).join(' → ')}
-        </p>}
-        <div aria-label="Unified diff" tabIndex={0} className="min-h-0 flex-1 overflow-auto rounded border border-slate-800 bg-slate-950 py-3 font-mono text-xs leading-relaxed sm:text-sm">
-          {(analysis?.unified_diff ?? '').split('\n').map((line, index) => (
-            <div key={index} className={`min-w-max whitespace-pre px-4 ${lineStyle(line)}`}>{line || ' '}</div>
-          ))}
-        </div>
-        <footer className="mt-4">
-          {rejection && <div role="alert" className="mb-3 rounded border border-crimson/50 bg-crimson/10 p-3 text-sm text-crimson">
-            <p>Patch rejected by prover: {rejection.passed_cells}/{rejection.total_cells} cells pass</p>
-            <p>Failing cells: {rejection.failed_cell_ids?.join(', ') || (rejection.import_error ? 'not run (import failed)' : 'none in the legacy matrix')}</p>
-            {rejection.authentication_admission && <p>Authentication admission: {rejection.authentication_admission.passed_check_count ?? 0}/{rejection.authentication_admission.configured_check_count ?? 24} checks passed (separate scope)</p>}
-            <p>{rejectionExplanation(rejection)}</p>
-            {rejection.import_error && <p className="mt-1 whitespace-pre-wrap break-words">{rejection.import_error}</p>}
-          </div>}
-          <div className="flex flex-wrap gap-3">
-          <button type="button" onClick={() => onApply(analysis.patched_code)} disabled={applying || !analysis?.patched_code}
-            className="flex items-center justify-center gap-2 rounded bg-brass px-5 py-3 font-semibold text-slate-950 hover:bg-amber-500 disabled:cursor-wait disabled:opacity-60">
-            {applying && <LoaderCircle aria-hidden="true" size={18} className="animate-spin" />}
-            {applying ? 'Verifying Patch Before Applying…' : 'Apply Atomic Patch & Re-Prove (27/27)'}
-          </button>
-          <button type="button" onClick={() => onApply(partialPatchCode)} disabled={applying || !partialPatchCode}
-            className="rounded border border-brass px-4 py-2 text-sm text-brass hover:bg-brass/10 disabled:opacity-60">
-            Test Naive Idempotency-Only Patch
-          </button>
-          </div>
-          {rejection && <button type="button" onClick={onApplyCached} disabled={applying}
-            className="mt-3 rounded border border-brass px-4 py-2 text-sm text-brass hover:bg-brass/10 disabled:opacity-60">
-            Apply cached patch instead
-          </button>}
-          {applying && <p role="status" className="mt-2 text-sm text-brass">Running all 27 proof cells…</p>}
-        </footer>
+  const selected = analysis?.model_routing?.selected_candidate;
+  const attempt = selected ?? analysis?.model_routing?.candidate_attempts?.at(-1);
+  return <dialog ref={dialogRef} aria-labelledby="patch-title" onCancel={(event) => { event.preventDefault(); if (!applying) onClose(); }} className="patch-dialog">
+    <div className="patch-workspace">
+      <header className="patch-header"><div><p className="eyebrow">Candidate review</p><h2 id="patch-title">Source diff · active_handler.py</h2></div><button type="button" onClick={onClose} disabled={applying}>Close</button></header>
+      <div className="patch-metadata"><p>{candidateSource(attempt?.provenance)} <code title={attempt?.candidate_sha256}>{shortHash(attempt?.candidate_sha256)}</code></p>
+        <p className={attempt?.result === 'rejected' ? 'fail' : ''}>Candidate evaluation: {attempt?.result === 'accepted' ? 'Accepted by configured checks; not yet installed' : attempt?.result === 'rejected' ? 'Rejected' : 'Not evaluated'}</p>
+        <p>Authentication admission: {attempt?.authentication_admission ? attempt.authentication_admission.passed ? 'Passed' : 'Failed' : 'Not evaluated'}</p>
+        {!!analysis?.model_routing?.cegis_rounds?.length && <p>{analysis.model_routing.cegis_rounds.map((round) => `Round ${round.round}: ${round.passed_cells}/27`).join(' → ')}</p>}
       </div>
-    </dialog>
-  );
+      <div aria-label="Unified diff" tabIndex={0} className="unified-diff">{(analysis?.unified_diff ?? 'No candidate diff recorded.').split('\n').map((line, index) => <div key={index} className={lineStyle(line)}><span aria-hidden="true" className="diff-line-number">{index + 1}</span><code>{line || ' '}</code></div>)}</div>
+      <footer className="patch-footer">
+        <div className="patch-messages">
+          {error && <p role="alert" className="fail">{error}</p>}
+          {rejection && <div role="alert" className="patch-rejection"><h3>Installation not accepted</h3>
+            {rejection.candidate_sha256 && <p>Evaluated candidate <code title={rejection.candidate_sha256}>{shortHash(rejection.candidate_sha256)}</code></p>}
+            <p>Business checks: {rejection.passed_cells ?? rejection.prover_report?.passed_cells ?? 'Not evaluated'} / {rejection.total_cells ?? rejection.prover_report?.total_cells ?? '—'} passed</p>
+            <p>Failing cells: {rejection.failed_cell_ids?.join(', ') || (rejection.import_error ? 'Not run (import failed)' : 'None reported in the legacy matrix')}</p>
+            <p className={rejection.authentication_admission?.passed === false ? 'warning' : ''}>Authentication admission: {rejection.authentication_admission ? `${rejection.authentication_admission.passed ? 'Passed' : 'Failed'} · ${rejection.authentication_admission.passed_check_count ?? '—'}/${rejection.authentication_admission.configured_check_count ?? '—'} checks passed (separate scope)` : 'Not evaluated'}</p>
+            <p>{rejectionExplanation(rejection)}</p>
+            {rejection.import_error && <p>{rejection.import_error}</p>}
+          </div>}
+        </div>
+        <div className="patch-actions"><button type="button" className="primary-button" onClick={() => onApply(analysis.patched_code)} disabled={applying || !analysis?.patched_code}>{applying && <LoaderCircle aria-hidden="true" size={14} className="animate-spin" />}{applying ? 'Verifying candidate…' : 'Verify & install candidate'}</button>
+          <button type="button" onClick={() => onApply(partialPatchCode)} disabled={applying || !partialPatchCode}>Test naive idempotency-only patch</button>
+          {rejection && <button type="button" onClick={onApplyCached} disabled={applying}>Verify & install cached patch</button>}
+        </div>
+        <p className="patch-scope" role={applying ? 'status' : undefined}>{applying ? 'Checking all 27 schedules and authentication admission. Awaiting installation confirmation…' : 'Installation requires backend acceptance of the exact candidate source. Strict qualification is not evaluated here.'}</p>
+      </footer>
+    </div>
+  </dialog>;
 }

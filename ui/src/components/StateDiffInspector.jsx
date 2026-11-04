@@ -1,3 +1,5 @@
+import { EVENT_NAMES, cellState } from './ProofMatrixGrid.jsx';
+
 function flatten(state, prefix = '', fields = {}) {
   for (const [key, value] of Object.entries(state ?? {})) {
     const path = prefix ? `${prefix}.${key}` : key;
@@ -42,11 +44,11 @@ function TraceUnavailable() {
 }
 
 function SqlStep({ entry, x, y, width = 220, duplicate, passed }) {
-  const color = duplicate ? '#EF4444' : passed ? '#10B981' : '#94a3b8';
+  const color = duplicate ? '#F17481' : passed ? '#55D4A0' : '#94a3b8';
   const label = entry.sql ? sqlLabel(entry.sql) : entry.message;
   return <g>
     <title>{`Trace #${entry.index + 1}: ${entry.raw}${duplicate ? ' — repeated side-effect candidate; see terminal state diff' : ''}`}</title>
-    <rect x={x} y={y} width={width} height="25" rx="4" fill="#0f172a" stroke={color} />
+    <rect x={x} y={y} width={width} height="25" rx="4" fill="#10151D" stroke={color} />
     <text x={x + 7} y={y + 17} fill={color} fontSize="11" fontFamily="monospace">{`${entry.index + 1}. ${label}`.slice(0, Math.floor(width / 6.7))}</text>
   </g>;
 }
@@ -62,8 +64,8 @@ function ScheduleDiagram({ cell }) {
     const cause = cell.failure_reason?.match(/\b(e[1-4])\b/)?.[1];
     diagram = <svg viewBox="0 0 600 64" width="100%" role="img" aria-label="Event arrival order">
       {cell.sequence.map((event, index) => <g key={index}>
-        <rect x={10 + index * 150} y="16" width="110" height="32" rx="5" fill="#0f172a" stroke={!cell.passed && cause === event ? '#EF4444' : '#D97706'} />
-        <text x={65 + index * 150} y="37" textAnchor="middle" fontSize="16" fill={!cell.passed && cause === event ? '#EF4444' : '#e2e8f0'}>{event}</text>
+        <rect x={10 + index * 150} y="16" width="110" height="32" rx="5" fill="#10151D" stroke={!cell.passed && cause === event ? '#F17481' : '#D99A53'} />
+        <text x={65 + index * 150} y="37" textAnchor="middle" fontSize="16" fill={!cell.passed && cause === event ? '#F17481' : '#e2e8f0'}>{event}</text>
         {index < cell.sequence.length - 1 && <text x={130 + index * 150} y="37" fill="#94a3b8" fontSize="18">→</text>}
       </g>)}
     </svg>;
@@ -90,12 +92,12 @@ function ScheduleDiagram({ cell }) {
     diagram = <svg viewBox={`0 0 600 ${top}`} width="100%" role="img" aria-label="Two worker SQL swimlanes and synchronization barrier">
       <text x="15" y="18" fill="#94a3b8" fontSize="12">Before release</text>
       <text x="350" y="18" fill="#94a3b8" fontSize="12">After release →</text>
-      <line x1="310" x2="310" y1="32" y2={top - 15} stroke="#D97706" strokeWidth="3" />
-      <text x="310" y="29" textAnchor="middle" fill="#D97706" fontSize="12">Barrier(2)</text>
+      <line x1="310" x2="310" y1="32" y2={top - 15} stroke="#D99A53" strokeWidth="3" />
+      <text x="310" y="29" textAnchor="middle" fill="#D99A53" fontSize="12">Barrier(2)</text>
       {layouts.map((lane) => <g key={lane.name}>
         <text x="15" y={lane.y + 10} fill="#e2e8f0" fontSize="13">{lane.name}</text>
         <line x1="15" x2="585" y1={lane.y + 20} y2={lane.y + 20} stroke="#334155" />
-        <circle cx="310" cy={lane.y + 20} r="5" fill="#D97706"><title>{lane.reached.raw}; {lane.release.raw}</title></circle>
+        <circle cx="310" cy={lane.y + 20} r="5" fill="#D99A53"><title>{lane.reached.raw}; {lane.release.raw}</title></circle>
         {lane.before.map((entry, index) => <SqlStep key={entry.index} entry={entry} x={15} y={lane.y + 30 + index * 31} width={270} passed={cell.passed} />)}
         {lane.after.map((entry, index) => <SqlStep key={entry.index} entry={entry} x={335} y={lane.y + 30 + index * 31} width={250} passed={cell.passed} duplicate={!cell.passed && repeated.has(effectKey(entry))} />)}
       </g>)}
@@ -128,8 +130,8 @@ function ScheduleDiagram({ cell }) {
         </g>)}
         {index === 0 && <g transform={`translate(10 ${y + 35 + Math.ceil(steps.length / 3) * 43})`}>
           <title>{crash.raw}</title>
-          <path d="M10 -14 L2 -3 H9 L5 8 L18 -6 H11 L15 -14 Z" fill="#EF4444" />
-          <text x="25" fill="#EF4444" fontSize="12">Injected crash · trace #{crash.index + 1}</text>
+          <path d="M10 -14 L2 -3 H9 L5 8 L18 -6 H11 L15 -14 Z" fill="#F17481" />
+          <text x="25" fill="#F17481" fontSize="12">Injected crash · trace #{crash.index + 1}</text>
         </g>}
       </g>)}
     </svg>;
@@ -161,82 +163,42 @@ function explainDiscrepancy(cell) {
   return `${labels[diff.field] ?? diff.field} should be ${format(diff.expected)}, but was ${format(diff.actual)}.`;
 }
 
-export default function StateDiffInspector({ cell, goldenState }) {
-  if (!cell) {
-    return <section className="rounded-lg border border-slate-800 bg-slate-900 p-5">Select a cell to inspect its state and trace.</section>;
-  }
-
+export default function StateDiffInspector({ cell, goldenState, traceOnly = false, onViewTrace }) {
+  if (!cell) return <p className="empty-state">Select a check to inspect its state and trace.</p>;
   const expected = flatten(goldenState);
   const actual = flatten(cell.actual_state);
-  const differences = new Map(cell.state_diff.map((entry) => [entry.field, entry]));
-  const fields = [...new Set([...Object.keys(expected), ...Object.keys(actual), ...differences.keys()])];
-
-  return (
-    <section aria-labelledby="inspector-heading" className="min-w-0 self-start rounded-lg border border-slate-800 bg-slate-900 p-5">
-      <header className="mb-6 space-y-3">
-        <h2 id="inspector-heading" className="text-lg font-semibold">Cell #{cell.id}: {cell.label}</h2>
-        <p className="text-xs uppercase tracking-widest text-slate-400">{cell.category === 'permutation' ? 'Arrival order' : 'Fault schedule'}</p>
-        <p className="break-words font-mono text-sm leading-relaxed text-slate-300">{cell.sequence.join(' → ')}</p>
-        {!cell.passed && <p className="break-words font-mono text-sm text-crimson">{cell.failure_tag}</p>}
-      </header>
-
-      <p className="mb-4 rounded border border-slate-700 bg-slate-950 p-3 text-sm leading-relaxed text-slate-200">{explainDiscrepancy(cell)}</p>
-
-      {cell.passed ? (
-        <p role="status" className="rounded border border-emerald/40 bg-emerald/10 p-4 font-medium text-emerald">State matches S*</p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <caption className="sr-only">Golden and actual terminal state for cell {cell.id}</caption>
-            <thead className="border-b border-slate-700 text-slate-300">
-              <tr>
-                <th scope="col" className="p-2">Field</th>
-                <th scope="col" className="p-2">Golden State S*</th>
-                <th scope="col" className="p-2">Actual Terminal State</th>
-              </tr>
-            </thead>
-            <tbody className="font-mono">
-              {fields.map((field) => {
-                const diff = differences.get(field);
-                const wanted = diff ? diff.expected : expected[field];
-                const received = diff ? diff.actual : actual[field];
-                const mismatched = !!diff || format(wanted) !== format(received);
-                return (
-                  <tr key={field} className={`border-b border-slate-800 ${mismatched ? 'bg-crimson/10 text-crimson' : 'text-slate-300'}`}>
-                    <th scope="row" className="break-words p-2 align-top font-normal">{field}</th>
-                    <td className="break-words p-2 align-top">{format(wanted)}</td>
-                    <td className="break-words p-2 align-top">
-                      {format(received)}
-                      {mismatched && <span className="mt-1 block text-xs">expected {format(wanted)}, got {format(received)}</span>}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      <details key={cell.id} className="mt-5">
-        <summary className="cursor-pointer text-sm text-brass">View schedule and full SQL trace</summary>
-      <ScheduleDiagram cell={cell} />
-
-      <section aria-labelledby="trace-heading" className="mt-8">
-        <h3 id="trace-heading" className="mb-4 text-sm font-semibold">SQL Interceptor &amp; Barrier Trace</h3>
-        {cell.sql_trace.length === 0 ? (
-          <p className="text-sm text-slate-400">No interception trace for this cell</p>
-        ) : (
-          <ol key={cell.id} aria-label="SQL trace steps" className="max-h-[36rem] overflow-y-auto rounded border border-slate-800 bg-slate-950 p-3 font-mono text-xs leading-relaxed text-slate-300">
-            {cell.sql_trace.map((entry, index) => (
-              <li key={index} className="flex gap-3 border-b border-slate-800/60 py-2 last:border-0">
-                <span className="w-7 shrink-0 text-right tabular-nums text-brass" aria-label={`Step ${index + 1}`}>{index + 1}.</span>
-                <span className="min-w-0 whitespace-pre-wrap break-words">{entry}</span>
-              </li>
-            ))}
-          </ol>
-        )}
-      </section>
-      </details>
-    </section>
-  );
+  const differences = new Map((cell.state_diff ?? []).map((entry) => [entry.field, entry]));
+  const fields = [...new Set([...differences.keys(), ...Object.keys(expected), ...Object.keys(actual)])];
+  const violations = cell.property_violations?.filter((v) => v.field !== 'execution.errors');
+  const errors = cell.property_violations?.filter((v) => v.field === 'execution.errors');
+  const state = cellState(cell);
+  return <section className="state-inspector" aria-label={traceOnly ? 'Selected schedule SQL trace' : 'Selected schedule state difference'}>
+    <header className="selected-summary">
+      <div><h3>Cell #{cell.id} · {cell.category === 'permutation' ? 'Arrival order' : cell.category === 'concurrency' ? 'Concurrent race' : cell.id === 26 ? 'Invoice crash / retry' : 'Checkout crash / retry'}</h3><span className={`state-label ${state}`}>{state === 'pass' ? '✓ PASS' : state === 'error' ? '! ERROR' : '× FAIL'}</span></div>
+      <p className="sequence">{cell.sequence.join(' → ')}</p>
+      <ol className="full-sequence" aria-label="Full event sequence">{cell.sequence.map((event, i) => <li key={i}>{event.replace(/e[1-4]/g, (id) => EVENT_NAMES[id])}</li>)}</ol>
+      {!cell.passed && <code className={state}>{cell.failure_tag ?? 'Failure code not recorded'}</code>}
+    </header>
+    {traceOnly ? <>
+      <p className="muted trace-note">SQL is logged before execution. A recorded statement does not prove a write committed.</p>
+      <details className="schedule-details"><summary>Schedule visualization</summary><ScheduleDiagram cell={cell} /></details>
+      <h3 className="content-heading">SQL execution trace <span>{cell.sql_trace?.length ?? 0} records</span></h3>
+      {!parseTrace(cell.sql_trace) ? <TraceUnavailable /> : cell.sql_trace.length === 0 ? <p>Trace unavailable: no records for this check.</p> : <ol aria-label="SQL trace steps" className="sql-steps">{cell.sql_trace.map((entry, index) => <li key={index}><span aria-label={`Step ${index + 1}`}>{index + 1}</span><code>{entry}</code></li>)}</ol>}
+    </> : <>
+      <p className="discrepancy">{explainDiscrepancy(cell)}</p>
+      <table className="state-table"><caption>Business state · Golden State S* vs. observed</caption><thead><tr><th scope="col">Property</th><th scope="col">Expected</th><th scope="col">Observed</th></tr></thead><tbody>{fields.map((field) => {
+        const diff = differences.get(field);
+        const wanted = diff ? diff.expected : expected[field];
+        const received = diff ? diff.actual : actual[field];
+        const mismatch = !!diff || format(wanted) !== format(received);
+        return <tr key={field} className={mismatch ? 'mismatch' : ''}><th scope="row">{mismatch && <span aria-label="Mismatch">× </span>}{field}</th><td>{format(wanted)}</td><td>{format(received)}</td></tr>;
+      })}</tbody></table>
+      {cell.failure_reason && <details className="failure-detail"><summary>Reported failure details</summary><p>{cell.failure_reason}</p></details>}
+      {!!errors?.length && <section className="execution-errors"><h4>Execution / synchronization errors</h4>{errors.map((v, i) => <p key={i}>Expected {format(v.expected)}; observed {format(v.actual)}</p>)}<p>Missing outcomes do not count as property passes.</p></section>}
+      {violations === undefined && <p className="warning">Property evidence: Not evaluated.</p>}
+      {!!violations?.length && <section className="property-violations"><h4>Business-property violations</h4><ul>{violations.map((v, i) => <li key={i}><code>{v.field}</code><span>Expected {format(v.expected)}; observed {format(v.actual)}</span></li>)}</ul></section>}
+      {cell.passed && <p className="pass state-match">✓ Terminal state matches Golden State S*</p>}
+      <button type="button" className="trace-link" onClick={onViewTrace}>Inspect SQL trace · {cell.sql_trace?.length ?? 0} records →</button>
+    </>}
+  </section>;
 }

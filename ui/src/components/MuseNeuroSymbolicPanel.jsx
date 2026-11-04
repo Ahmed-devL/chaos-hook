@@ -2,7 +2,7 @@ import { useId, useState } from 'react';
 import { LoaderCircle } from 'lucide-react';
 
 const ARCHITECTURE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="650" viewBox="0 0 1100 650">
-  <rect width="1100" height="650" fill="#020617"/>
+  <rect width="1100" height="650" fill="#080B10"/>
   <g font-family="Arial, sans-serif" fill="#e2e8f0">
     <text x="45" y="55" font-size="28">NovaCloud Stripe webhook flow</text>
     <text x="45" y="95" font-size="20" fill="#fbbf24">assumes in-order, exactly-once delivery</text>
@@ -11,7 +11,7 @@ const ARCHITECTURE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="1100" h
       <text x="45" y="185">e1 checkout.session.completed → e2 customer.subscription.created</text>
       <text x="45" y="215">→ e3 invoice.paid → e4 customer.subscription.deleted</text>
     </g>
-    <g stroke="#d97706" stroke-width="2" fill="#0f172a">
+    <g stroke="#D99A53" stroke-width="2" fill="#10151D">
       <rect x="45" y="335" width="155" height="65" rx="8"/>
       <rect x="270" y="335" width="235" height="65" rx="8"/>
       <rect x="575" y="335" width="150" height="65" rx="8"/>
@@ -21,7 +21,7 @@ const ARCHITECTURE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="1100" h
       <rect x="825" y="450" width="235" height="50" rx="6"/>
       <rect x="825" y="515" width="235" height="50" rx="6"/>
     </g>
-    <g stroke="#d97706" stroke-width="3" fill="none">
+    <g stroke="#D99A53" stroke-width="3" fill="none">
       <path d="M200 367 H270 M258 360 L270 367 L258 374"/>
       <path d="M505 367 H575 M563 360 L575 367 L563 374"/>
       <path d="M725 367 H775 V280 H825 M775 345 H825 M775 410 H825 M775 367 V540 H825 M775 475 H825"/>
@@ -107,7 +107,7 @@ function LifecycleDiagram({ clusters, activeCluster }) {
   const broken = new Set(clusters.flatMap(edgeKinds));
   const highlighted = new Set(activeCluster === null ? [] : edgeKinds(clusters[activeCluster]));
   const edge = (kind) => ({
-    stroke: broken.has(kind) ? '#EF4444' : '#64748B',
+    stroke: broken.has(kind) ? '#F17481' : '#64748B',
     strokeDasharray: broken.has(kind) ? '6 4' : undefined,
     strokeWidth: highlighted.has(kind) ? 4 : 2,
     opacity: activeCluster === null || highlighted.has(kind) ? 1 : 0.35,
@@ -140,7 +140,7 @@ function LifecycleDiagram({ clusters, activeCluster }) {
         </g>
         {['checkout', 'sub created', 'invoice paid', 'sub deleted'].map((label, index) => (
           <g key={label}>
-            <circle cx={80 + index * 160} cy="110" r="22" fill="#0F172A" stroke="#D97706" strokeWidth="2" />
+            <circle cx={80 + index * 160} cy="110" r="22" fill="#10151D" stroke="#D99A53" strokeWidth="2" />
             <text x={80 + index * 160} y="115" textAnchor="middle" fill="#F8FAFC" fontSize="14">e{index + 1}</text>
             <text x={80 + index * 160} y="154" textAnchor="middle" fill="#CBD5E1" fontSize="12">{label}</text>
           </g>
@@ -151,71 +151,37 @@ function LifecycleDiagram({ clusters, activeCluster }) {
   );
 }
 
-export default function MuseNeuroSymbolicPanel({ analysis, loading, onSelectCell, onOpenPatch, sendDiagram, onSendDiagramChange, diagramImage, onDiagramImageChange }) {
+export default function MuseNeuroSymbolicPanel({ analysis, loading, disabled, onSelectCell, onOpenPatch, sendDiagram, onSendDiagramChange, diagramImage, onDiagramImageChange }) {
   const [activeCluster, setActiveCluster] = useState(null);
-  const cached = analysis?.model_routing.used_fallback_cache;
-
-  return (
-    <section aria-label="Muse neuro-symbolic analysis" aria-busy={loading} className="mt-6 rounded-lg border border-slate-800 bg-slate-900 p-5">
-      <header className="mb-5 flex flex-wrap items-center gap-3 text-xs font-semibold">
-        <span className="rounded border border-slate-700 px-3 py-2">Meta Muse Spark 1.3</span>
-        <span className="rounded border border-slate-700 px-3 py-2">Meta Muse Wonder</span>
-        <span className={`rounded border px-3 py-2 ${cached === true ? 'border-brass text-brass' : cached === false ? 'border-emerald text-emerald' : 'border-slate-700 text-slate-400'}`}>
-          {cached === true ? 'ANALYSIS USES CACHE' : cached === false ? 'LIVE RESPONSES' : 'SOURCE PENDING'}
-        </span>
-      </header>
-      {analysis && <p className="mb-3 inline-block rounded border border-slate-700 px-2 py-1 text-xs text-brass">Spark saw diagram: {analysis.model_routing.spark_live ? analysis.model_routing.spark_multimodal ? 'yes' : 'no (text-only)' : 'cached'}</p>}
-      <DiagramInput enabled={sendDiagram} onEnabledChange={onSendDiagramChange} image={diagramImage} onImageChange={onDiagramImageChange} disabled={loading} />
-      {loading ? (
-        <p role="status" className="flex items-center gap-2 text-brass"><LoaderCircle aria-hidden="true" size={18} className="animate-spin" />Diagnosing failures and synthesizing an atomic patch…</p>
-      ) : !analysis ? (
-        <p className="text-slate-400">Run the prover, then Diagnose</p>
-      ) : (
-        <>
-          <div className="grid gap-8 lg:grid-cols-2">
-            <section aria-labelledby="spark-heading" className="min-w-0">
-              <h2 id="spark-heading" className="mb-3 text-lg font-semibold">Muse Spark 1.3 Diagnosis</h2>
-              <p className="text-slate-300">{analysis.diagnosis.summary_headline}</p>
-              {analysis.diagnosis.diagram_findings?.length > 0 && <ul className="my-3 list-disc space-y-2 pl-5 text-sm text-brass">{analysis.diagnosis.diagram_findings.map((finding, index) => <li key={index}>{finding}</li>)}</ul>}
-              <LifecycleDiagram clusters={analysis.diagnosis.failure_clusters} activeCluster={activeCluster} />
-              <div className="space-y-3">
-                {analysis.diagnosis.failure_clusters.map((cluster, index) => (
-                  <article key={cluster.title} tabIndex={0}
-                    onMouseEnter={() => setActiveCluster(index)} onMouseLeave={() => setActiveCluster(null)}
-                    onFocus={() => setActiveCluster(index)} onBlur={() => setActiveCluster(null)}
-                    className={`rounded border p-4 focus-visible:outline focus-visible:outline-brass ${activeCluster === index ? 'border-crimson bg-crimson/10' : 'border-slate-700'}`}>
-                    <h3 className="mb-2 font-medium text-crimson">{cluster.title}</h3>
-                    <p className="text-sm leading-relaxed text-slate-300">{cluster.description}</p>
-                  </article>
-                ))}
-              </div>
-              <h3 className="mb-2 mt-5 font-medium text-brass">Remediation proof plan</h3>
-              <p className="text-sm leading-relaxed text-slate-300">{analysis.diagnosis.remediation_proof_plan}</p>
-            </section>
-            <section aria-labelledby="wonder-heading" className="min-w-0">
-              <h2 id="wonder-heading" className="mb-4 text-lg font-semibold">Muse Wonder · Formal Conservation Invariants</h2>
-              <div className="space-y-4">
-                {analysis.invariants.map((invariant) => (
-                  <article key={invariant.id} className="rounded border border-slate-700 p-4">
-                    <h3 className="font-medium"><span className="mr-2 font-mono text-brass">{invariant.id}</span>{invariant.title}</h3>
-                    <p className="my-3 break-words rounded bg-slate-950 p-3 font-mono text-sm text-brass">{invariant.formal_expr}</p>
-                    <p className="text-sm leading-relaxed text-slate-300">{invariant.description}</p>
-                    <p className="mb-2 mt-3 text-xs text-slate-400">Violated by cells</p>
-                    <div className="flex flex-wrap gap-2">
-                      {invariant.violated_by_cells.map((cellId) => (
-                        <button type="button" key={cellId} onClick={() => onSelectCell(cellId)} aria-label={`${invariant.id}: inspect cell #${cellId}`}
-                          className="rounded border border-crimson/40 bg-crimson/5 px-2 py-1 font-mono text-xs text-crimson hover:bg-crimson/20 focus-visible:outline focus-visible:outline-brass">#{cellId}</button>
-                      ))}
-                      {invariant.violated_by_cells.length === 0 && <span className="text-xs text-emerald">No violations</span>}
-                    </div>
-                  </article>
-                ))}
-              </div>
-            </section>
-          </div>
-          <button type="button" onClick={onOpenPatch} className="mt-6 rounded bg-brass px-5 py-3 font-semibold text-slate-950 hover:bg-amber-500 focus-visible:outline focus-visible:outline-offset-4 focus-visible:outline-brass">View Atomic Patch</button>
-        </>
-      )}
-    </section>
-  );
+  const routing = analysis?.model_routing;
+  return <section aria-label="Muse neuro-symbolic analysis" aria-busy={loading} className="muse-panel">
+    <header className="muse-routing"><h3>Guided diagnosis &amp; synthesis</h3><p>Muse Wonder · Muse Spark 1.3</p>
+      <p>{!analysis ? 'No analysis recorded' : `Wonder: ${routing?.wonder_live ? 'Live response' : 'Cached response'} · Spark: ${routing?.spark_live ? 'Live response' : 'Cached response'}`}</p>
+      {routing?.used_fallback_cache && <p className="warning">Cached fallback used{routing.fallback_reason ? ` · ${routing.fallback_reason}` : ''}</p>}
+      {analysis && <p>Spark diagram: {routing?.spark_live ? routing.spark_multimodal ? 'Received image' : 'Text only' : 'Cached analysis; no live image evaluation'}</p>}
+    </header>
+    {loading && <p role="status" className="muse-progress"><LoaderCircle aria-hidden="true" size={14} className="animate-spin" />Diagnosing failures and synthesizing a candidate. Evaluation must complete before installation.</p>}
+    {!analysis && !loading && <p className="muse-intro">Run verification, then use Diagnose / synthesize. Wonder extracts invariants and proposes source; Spark explains the failures and diagram.</p>}
+    {analysis && <>
+      <button type="button" className="primary-button review-candidate" disabled={disabled} onClick={onOpenPatch}>Review candidate diff →</button>
+      {!!routing?.cegis_rounds?.length && <p className="cegis-rounds">CEGIS: {routing.cegis_rounds.map((round) => `Round ${round.round}: ${round.passed_cells}/27`).join(' → ')}</p>}
+      <section aria-labelledby="spark-heading"><h3 id="spark-heading">Spark · Failure diagnosis</h3>
+        <p className="diagnosis-headline">{analysis.diagnosis.summary_headline}</p>
+        {!!analysis.diagnosis.diagram_findings?.length && <ul className="diagram-findings">{analysis.diagnosis.diagram_findings.map((finding, i) => <li key={i}>{finding}</li>)}</ul>}
+        <div className="failure-clusters">{analysis.diagnosis.failure_clusters.map((cluster, index) => <article key={cluster.title} tabIndex={0}
+          onMouseEnter={() => setActiveCluster(index)} onMouseLeave={() => setActiveCluster(null)} onFocus={() => setActiveCluster(index)} onBlur={() => setActiveCluster(null)} className={activeCluster === index ? 'active-cluster' : ''}>
+          <h4>{cluster.title}</h4><p>{cluster.description}</p><div className="cell-links">{cluster.cells.map((id) => <button type="button" key={id} onClick={() => onSelectCell(id)} aria-label={`Inspect cell #${id}`}>#{id}</button>)}</div>
+        </article>)}</div>
+        <details className="diagnosis-diagram"><summary>Diagnosed lifecycle diagram</summary><LifecycleDiagram clusters={analysis.diagnosis.failure_clusters} activeCluster={activeCluster} /></details>
+        <h4 className="remediation-heading">Remediation proof plan</h4><p>{analysis.diagnosis.remediation_proof_plan}</p>
+      </section>
+      <section aria-labelledby="wonder-heading"><h3 id="wonder-heading">Wonder · Conservation invariants</h3><div className="invariant-list">{analysis.invariants.map((invariant) => <article key={invariant.id}>
+        <h4><code>{invariant.id}</code> {invariant.title}</h4><p className="formal-expression">{invariant.formal_expr}</p><p>{invariant.description}</p>
+        <p className="muted">Violated by cells</p><div className="cell-links">{invariant.violated_by_cells.map((id) => <button type="button" key={id} onClick={() => onSelectCell(id)} aria-label={`${invariant.id}: inspect cell #${id}`}>#{id}</button>)}{!invariant.violated_by_cells.length && <span className="pass">No violations</span>}</div>
+      </article>)}</div></section>
+    </>}
+    <details className="diagram-settings" open={analysis ? undefined : true}><summary>Diagram input · {sendDiagram ? diagramImage ? 'Uploaded image enabled' : 'Built-in diagram enabled' : 'Disabled'}</summary>
+      <DiagramInput enabled={sendDiagram} onEnabledChange={onSendDiagramChange} image={diagramImage} onImageChange={onDiagramImageChange} disabled={disabled} />
+    </details>
+  </section>;
 }

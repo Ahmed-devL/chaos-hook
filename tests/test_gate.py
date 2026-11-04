@@ -2860,9 +2860,26 @@ import assert from 'node:assert/strict';
 import { isVerifiedPatchResponse } from './ui/src/api.js';
 const report = {passed_cells: 27, total_cells: 27,
   cells: Array.from({length: 27}, (_, i) => ({id: i + 1, passed: true}))};
-const good = {status: 'ok', verified: true, prover_report: report};
+const candidate_sha256 = 'a'.repeat(64);
+const checks = [1, 2, 3, 4].flatMap(n =>
+  ['missing', 'malformed', 'wrong_key', 'modified_body', 'expired', 'valid'].map(name => ({id: `${n}:${name}`, passed: true})));
+const admission = {scope: 'stripe-authentication-admission-v1', candidate_sha256,
+  passed: true, configured_check_count: 24, executed_check_count: 24, passed_check_count: 24, checks};
+const good = {status: 'ok', verified: true, prover_report: report,
+  handler_status: {active_code: '# installed source'}, verification_evidence: {candidate_sha256},
+  authentication_admission: admission};
 assert.equal(isVerifiedPatchResponse(good), true);
 for (const result of [null, {}, {...good, verified: false}, {...good, status: 'rejected'},
+  {...good, authentication_admission: undefined},
+  {...good, authentication_admission: {...admission, passed: false}},
+  {...good, authentication_admission: {...admission, candidate_sha256: 'different-source'}},
+  {...good, authentication_admission: {...admission, executed_check_count: 23}},
+  {...good, authentication_admission: {...admission, checks: Array(24).fill(checks[0])}},
+  {...good, authentication_admission: {...admission, checks: {length: 24}}},
+  {...good, authentication_admission: {...admission, checks: Array(24).fill(null)}},
+  {...good, authentication_admission: {...admission, checks: checks.map(c => ({...c, passed: false}))}},
+  {...good, handler_status: undefined}, {...good, verification_evidence: undefined},
+  {...good, verification_evidence: {candidate_sha256: ''}},
   {...good, prover_report: {...report, passed_cells: 9}},
   {...good, prover_report: {...report, cells: []}},
   {...good, prover_report: {...report, cells: report.cells.map(c => ({...c, passed: false}))}}]) {
@@ -3063,3 +3080,72 @@ def test_authentication_manifest_redacts_free_text_and_fails_closed(authenticati
         manifest = export_verification_manifest(prepared, changed)
         assert not manifest['candidate_acceptance']['accepted']
         assert not manifest['authentication_admission']['passed']
+
+
+def test_frontend_workbench_render_smoke(reports, tmp_path):
+    """Render the real panes against SQL reports with Vite's existing toolchain."""
+    node = shutil.which('node')
+    root = Path(__file__).resolve().parents[1]
+    ui = root / 'ui'
+    if not node or not (ui / 'node_modules' / 'esbuild').exists():
+        pytest.skip('Node and installed frontend dependencies are required for render smoke checks')
+    payload = tmp_path / 'reports.json'
+    payload.write_text(json.dumps(reports))
+    script = r'''
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const React = require('react');
+const {renderToStaticMarkup} = require('react-dom/server');
+const {buildSync} = require('esbuild');
+const source = `
+export {default as App} from './src/App.jsx';
+export {default as Matrix, CandidateEvidence} from './src/components/ProofMatrixGrid.jsx';
+export {default as Inspector} from './src/components/StateDiffInspector.jsx';
+export {default as Muse} from './src/components/MuseNeuroSymbolicPanel.jsx';
+export {default as Patch} from './src/components/CodeDiffPatchModal.jsx';
+`;
+const compiled = buildSync({stdin: {contents: source, resolveDir: process.cwd(), loader: 'jsx'},
+  bundle: true, write: false, platform: 'node', format: 'cjs', jsx: 'automatic',
+  external: ['react', 'react/jsx-runtime', 'lucide-react']}).outputFiles[0].text;
+const result = {exports: {}};
+new Function('require', 'module', 'exports', compiled)(require, result, result.exports);
+const panes = result.exports;
+const render = (Component, props = {}) => renderToStaticMarkup(React.createElement(Component, props));
+const reports = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
+const app = render(panes.App);
+assert(app.includes('ChaosHook'));
+assert(app.includes('Find, repair, and verify webhook failures.'));
+assert(!/Brass Escapement|Horological/.test(app));
+assert(app.includes('/favicon.svg'));
+for (const report of Object.values(reports)) {
+  const matrix = render(panes.Matrix, {cells: report.cells, selectedId: 25, onSelect() {}});
+  assert.equal((matrix.match(/aria-label="Cell #/g) || []).length, 27);
+  assert.equal((matrix.match(/aria-pressed="true"/g) || []).length, 1);
+  for (const id of [1, 25, 26, 27]) {
+    const cell = report.cells.find(cell => cell.id === id);
+    const props = {cell, goldenState: report.golden_state};
+    const state = render(panes.Inspector, props);
+    assert(state.includes(`Cell #${id}`));
+    assert(state.includes('Expected'));
+    assert(state.includes('Observed'));
+    assert(state.includes('checkout.session.completed'));
+    const trace = render(panes.Inspector, {...props, traceOnly: true});
+    assert(trace.includes('SQL trace steps'));
+    assert(trace.includes('logged before execution'));
+    if (!cell.passed) assert(state.includes(cell.failure_tag));
+  }
+}
+const muse = render(panes.Muse, {sendDiagram: true});
+assert(muse.includes('No analysis recorded'));
+assert(muse.includes('type="file"'));
+assert(muse.includes('Send diagram to Spark 1.3'));
+const audit = render(panes.CandidateEvidence);
+assert(audit.includes('Not evaluated'));
+assert(audit.includes('historical experiment trials are not included'));
+const patch = render(panes.Patch, {open: false});
+assert(patch.includes('Verify &amp; install candidate'));
+assert(patch.includes('Authentication admission: Not evaluated'));
+'''
+    completed = subprocess.run([node, '-e', script, str(payload)], cwd=ui,
+                               capture_output=True, text=True, timeout=30)
+    assert completed.returncode == 0, completed.stderr

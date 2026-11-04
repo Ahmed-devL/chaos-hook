@@ -4,9 +4,9 @@ export default {
   theme: {
     extend: {
       colors: {
-        brass: '#D97706',
-        crimson: '#EF4444',
-        emerald: '#10B981',
+        brass: '#D99A53',
+        crimson: '#F17481',
+        emerald: '#55D4A0',
       },
     },
   },
