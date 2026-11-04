@@ -173,3 +173,48 @@ class LifecycleScenarioSpec:
 
 
 SCENARIO_SPEC = LifecycleScenarioSpec()
+
+
+SEMANTIC_CONTRACT_ID = "novacloud-causal-counterfactual-v1"
+
+
+def semantic_expected_state(scenario, delivered):
+    """Declarative event-set oracle, never an execution of a reference handler.
+
+    Contract v1: unique event IDs; one subscription; distinct eligible paid
+    invoice identities; 100 credits each. Lifecycle events have distinct,
+    authoritative synthetic timestamps. Invoice time does not change the plan.
+    Only delivered events may justify business effects at a checkpoint.
+    """
+    events = {event["id"]: event for event in delivered}.values()
+    lifecycle = [e for e in events if e["type"] in {
+        "checkout.session.completed", "customer.subscription.created",
+        "customer.subscription.deleted",
+    }]
+    subscriptions = [e for e in lifecycle if e["type"].startswith("customer.subscription.")]
+    checkouts = [e for e in events if e["type"] == "checkout.session.completed"]
+    invoices = sorted({e["data"]["object"]["id"] for e in events if e["type"] == "invoice.paid"})
+    latest = max(lifecycle, key=lambda e: e["created"], default=None)
+    plan = ("free" if latest is None else "canceled"
+            if latest["type"] == "customer.subscription.deleted" else "pro")
+    users = scenario.initial_users()
+    users[0].update(plan_tier=plan,
+                    credit_balance=scenario.initial_credit_balance + 100 * len(invoices),
+                    welcome_email_sent=int(bool(checkouts)))
+    # Watermarks are an implementation mechanism, not an observable requirement.
+    for user in users:
+        if user["id"] == scenario.user_id:
+            user.pop("last_event_ts")
+    subs = []
+    if subscriptions:
+        newest = max(subscriptions, key=lambda e: e["created"])
+        subs = [{"id": scenario.subscription_id, "user_id": scenario.user_id,
+                 "stripe_customer_id": scenario.customer_id,
+                 "status": "canceled" if newest["type"].endswith("deleted") else "active",
+                 "current_period_end": max(e["data"]["object"]["current_period_end"] for e in subscriptions)}]
+    return {
+        "users": sorted(users, key=lambda u: u["id"]), "subscriptions": subs,
+        "ledger": [{"user_id": scenario.user_id, "invoice_id": invoice,
+                    "delta": 100, "reason": "invoice.paid"} for invoice in invoices],
+        "outbox": [{"user_id": scenario.user_id, "template": "welcome_pro"}] if checkouts else [],
+    }

@@ -102,3 +102,25 @@ def diff_states(golden: dict, actual: dict) -> list[dict]:
         if expected != observed:
             differences.append({"field": field, "expected": expected, "actual": observed})
     return differences
+
+
+def extract_semantic_state(session, scenario):
+    """Observe every business row, retaining identities and individual deltas."""
+    def rows(model, fields):
+        return [{field: getattr(row, field) for field in fields}
+                for row in session.scalars(select(model))]
+
+    users = rows(User, ("id", "email", "stripe_customer_id", "plan_tier",
+                        "credit_balance", "welcome_email_sent", "last_event_ts"))
+    for user in users:
+        if user["id"] == scenario.user_id:
+            user.pop("last_event_ts")
+    return {
+        "users": sorted(users, key=lambda u: u["id"]),
+        "subscriptions": sorted(rows(Subscription, ("id", "user_id", "stripe_customer_id",
+                                                      "status", "current_period_end")), key=lambda s: s["id"]),
+        "ledger": sorted(rows(CreditLedger, ("user_id", "invoice_id", "delta", "reason")),
+                         key=lambda r: (r["invoice_id"], r["user_id"], r["delta"], r["reason"])),
+        "outbox": sorted(rows(OutboxEmail, ("user_id", "template")),
+                         key=lambda r: (r["user_id"], r["template"])),
+    }

@@ -219,7 +219,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-docs
+docs/*
+!docs/ADVERSARIAL_AUDIT_RESPONSE.md
 AGENTS.md
 
 # Frontend dependencies installed by npm ci

@@ -114,3 +114,20 @@ def sign_event(event: dict, timestamp: int | None = None) -> tuple[bytes, str]:
     """Return handler arguments, signing now by default even for old events."""
     raw_body = serialize_event(event)
     return raw_body, sign_stripe_payload(raw_body, timestamp=timestamp)
+
+
+def semantic_challenges():
+    """Structurally different histories, each with a nonzero balance and bystander."""
+    scenario = scenario_from_seed(741)
+    events = get_canonical_events(scenario)
+    second_invoice = deepcopy(events[2])
+    second_invoice["id"] += "_second"
+    second_invoice["created"] += 50
+    second_invoice["data"]["object"]["id"] += "_second"
+    return scenario, [
+        ("A-canceled", [events[i] for i in (0, 1, 2, 3)]),
+        ("B-active", [events[i] for i in (0, 1, 2)]),
+        ("C-active-no-invoice", [events[i] for i in (0, 1)]),
+        ("C-canceled-no-invoice", [events[i] for i in (0, 1, 3)]),
+        ("D-two-invoices", [*events[:3], second_invoice]),
+    ]

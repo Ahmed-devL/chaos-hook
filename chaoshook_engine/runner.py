@@ -416,3 +416,69 @@ def run_algebraic_prover(handler_fn, scenario=SCENARIO_SPEC) -> dict:
         "passed_cells": passed, "failed_cells": 27 - passed,
         "duration_ms": round((perf_counter() - started) * 1000, 3), "cells": cells,
     }
+
+
+def run_semantic_challenges(handler_fn):
+    """Separate strict scope: all permutations, every prefix, then duplicate replay.
+
+    One check is one complete state observation (including S0). One schedule is
+    one isolated SQLite history. No race/crash schedules are claimed here; those
+    remain mandatory in the unchanged legacy gate.
+    """
+    from copy import deepcopy
+    from chaoshook_engine.fixtures import semantic_challenges
+    from chaoshook_engine.scenario_spec import SEMANTIC_CONTRACT_ID, semantic_expected_state
+    from chaoshook_engine.snapshot import extract_semantic_state
+
+    scenario, challenges = semantic_challenges()
+    runs = []
+    with TemporaryDirectory(prefix="chaoshook-semantic-") as folder:
+        for scenario_id, events in challenges:
+            schedules = []
+            for number, order in enumerate(permutations(range(len(events))), 1):
+                checks, delivered, errors = [], [], []
+                trace = []
+                with _cell(Path(folder) / f"{scenario_id}-{number}.db", trace, scenario=scenario) as engine:
+                    def observe(check_id):
+                        expected = semantic_expected_state(scenario, delivered)
+                        with Session(engine) as session:
+                            actual = extract_semantic_state(session, scenario)
+                        # Evidence exposes fixed property names only, never candidate
+                        # exception messages, SQL traces, source, or arbitrary DB values.
+                        fields = []
+                        for table in expected:
+                            if expected[table] == actual[table]:
+                                continue
+                            if len(expected[table]) != len(actual[table]):
+                                fields.append(table + ".rows")
+                            columns = sorted({key for row in [*expected[table], *actual[table]] for key in row})
+                            for column in columns:
+                                if ([row.get(column) for row in expected[table]] !=
+                                        [row.get(column) for row in actual[table]]):
+                                    fields.append(table + "." + column)
+                        checks.append({"id": check_id, "passed": not fields and not errors,
+                                       "business_property_violations": fields,
+                                       "execution_errors": ["handler_execution_error"] if errors else []})
+                    observe("prefix:0")
+                    for prefix, index in enumerate(order, 1):
+                        payload = events[index]
+                        _safe_delivery(engine, handler_fn, deepcopy(payload), trace, errors)
+                        delivered.append(payload)
+                        observe(f"prefix:{prefix}")
+                        _safe_delivery(engine, handler_fn, deepcopy(payload), trace, errors)
+                        observe(f"prefix:{prefix}:duplicate")
+                schedules.append({"id": number, "event_ids": [events[i]["id"] for i in order],
+                                  "checks": checks, "passed": all(c["passed"] for c in checks)})
+            runs.append({"scenario_id": scenario_id, "families": [scenario_id[0], "E"],
+                         "fixture_sha256": _json_hash({"users": scenario.initial_users(), "events": events}),
+                         "executed_schedule_count": len(schedules),
+                         "executed_check_count": sum(len(s["checks"]) for s in schedules),
+                         "passed_check_count": sum(c["passed"] for s in schedules for c in s["checks"]),
+                         "passed": all(s["passed"] for s in schedules), "schedules": schedules})
+    return {"contract_identifier": SEMANTIC_CONTRACT_ID,
+            "oracle_source_sha256": sha256(Path(__file__).with_name("scenario_spec.py").read_bytes()).hexdigest(),
+            "scope": "semantic_permutations_prefixes_and_sequential_duplicates",
+            "executed_schedule_count": sum(r["executed_schedule_count"] for r in runs),
+            "executed_check_count": sum(r["executed_check_count"] for r in runs),
+            "passed_check_count": sum(r["passed_check_count"] for r in runs),
+            "qualified": bool(runs) and all(r["passed"] for r in runs), "runs": runs}

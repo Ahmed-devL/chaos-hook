@@ -17,7 +17,7 @@ _LOCK = RLock()
 _MODULE = "target_app.handlers.active_handler"
 
 
-def verify_candidate_patch(code: str) -> dict:
+def verify_candidate_patch(code: str, *, strict_semantic=False) -> dict:
     """Import and prove a candidate outside the repo without installing it."""
     from chaoshook_engine.runner import run_algebraic_prover
 
@@ -49,6 +49,9 @@ def verify_candidate_patch(code: str) -> dict:
                 executed_check_ids=[cell["id"] for cell in report["cells"]],
                 failed_cell_ids=[cell["id"] for cell in report["cells"] if not cell["passed"]],
             )
+            if strict_semantic:
+                from chaoshook_engine.runner import run_semantic_challenges
+                result["strict_semantic"] = run_semantic_challenges(handler)
             return result
         finally:
             sys.modules.pop(name, None)
@@ -105,10 +108,14 @@ def _install(code: str) -> dict:
         return get_active_handler_status()
 
 
-def apply_patch_to_active(patched_code: str | None = None) -> dict:
+def apply_patch_to_active(patched_code: str | None = None, *, require_strict_semantic=False) -> dict:
     code = patched_code if patched_code is not None else (
         HANDLER_DIR / "v2_patched.py"
     ).read_text(encoding="utf-8")
+    if require_strict_semantic:
+        evidence = qualify_semantic_candidate(code)
+        if not evidence["strict_qualification"]["qualified"]:
+            raise ValueError("Candidate failed strict semantic qualification")
     return _install(code)
 
 
@@ -269,4 +276,36 @@ def qualify_candidate_patch(code: str, seeds, *, contract=SCENARIO_SPEC, candida
         "not_evaluated_reason": f"base_verification_{base_status}" if not base["accepted"] else None,
         "errors": errors,
     }
+    return manifest
+
+
+def qualify_semantic_candidate(code: str) -> dict:
+    """Freeze source and export legacy acceptance separately from strict semantics.
+
+    Always attempt semantic checks, even after a business failure of the legacy
+    gate. Import/execution infrastructure failures can never qualify a candidate.
+    """
+    from chaoshook_engine.runner import export_verification_manifest
+    from chaoshook_engine.scenario_spec import SEMANTIC_CONTRACT_ID
+
+    try:
+        verification = verify_candidate_patch(code, strict_semantic=True)
+    except Exception:
+        verification = {"candidate_sha256": sha256(code.encode()).hexdigest(),
+                        "verification_error": True}
+    manifest = export_verification_manifest(code, verification)
+    semantic = verification.get("strict_semantic")
+    manifest["strict_semantic"] = semantic or {
+        "contract_identifier": SEMANTIC_CONTRACT_ID,
+        "scope": "semantic_permutations_prefixes_and_sequential_duplicates",
+        "executed_schedule_count": 0, "executed_check_count": 0,
+        "passed_check_count": 0, "qualified": False, "runs": [],
+        "error": "candidate_import_error" if verification.get("import_error") else "verification_error",
+    }
+    manifest["strict_qualification"] = {
+        "qualified": manifest["runtime_acceptance"]["accepted"] and bool(semantic and semantic["qualified"]),
+        "requires": ["legacy_27", SEMANTIC_CONTRACT_ID],
+        "installation_default": "legacy_flow_unchanged; strict_requires_explicit_option",
+    }
+    # Retain the legacy manifest's schedule scope; semantic counts are separate.
     return manifest

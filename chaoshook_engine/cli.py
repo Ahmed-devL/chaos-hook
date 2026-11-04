@@ -266,12 +266,26 @@ def main(argv=None) -> int:
     qualify.add_argument("--seed", type=int, action="append", dest="seeds", required=True)
     qualify.add_argument("--manifest", type=Path, help="Also save the returned schema-v1 JSON manifest")
     qualify.add_argument("--candidate-audit", type=Path, help="Existing hash-bound candidate audit or model_routing JSON")
+    semantic = commands.add_parser("qualify-semantic", help="Strict causal/counterfactual qualification; no Muse or install")
+    semantic.add_argument("--source", type=Path, required=True)
+    semantic.add_argument("--manifest", type=Path)
     demo = commands.add_parser("demo", help="Write deterministic offline baseline and prepared repair evidence")
     demo.add_argument("--out", type=Path, required=True, help="Evidence output directory")
     demo.add_argument("--seed", type=int, action="append", dest="seeds", help="Qualification seeds (default: 101, 202, 303)")
     args = parser.parse_args(argv)
     if args.command == 'preflight':
         return preflight(args.live)
+    if args.command == "qualify-semantic":
+        from chaoshook_engine.patcher import qualify_semantic_candidate
+
+        if args.manifest and args.manifest.resolve() == args.source.resolve():
+            parser.error("Manifest output must differ from source")
+        result = qualify_semantic_candidate(args.source.read_bytes().decode("utf-8"))
+        payload = json.dumps(result, indent=2, sort_keys=True) + "\n"
+        if args.manifest:
+            args.manifest.write_text(payload, encoding="utf-8")
+        print(payload, end="")
+        return 0 if result["strict_qualification"]["qualified"] else 1
     if args.command == "demo":
         try:
             return offline_demo(args.out, args.seeds if args.seeds is not None else [101, 202, 303])

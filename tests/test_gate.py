@@ -2119,3 +2119,126 @@ def test_preflight_reports_missing_tools_and_temp_failure(monkeypatch, capsys):
     report = json.loads(payload)
     assert not report['checks']['node'] and not report['checks']['runner_tmp_writable']
     assert 'private-filesystem-detail' not in payload
+
+
+# Test-only evaluator-style probe. Keep the real claim/credit/outbox behavior,
+# then override lifecycle outcomes regardless of which events were delivered.
+HARDCODED_CANCELLATION_PROBE = '''
+from sqlalchemy import select
+from target_app.handlers.v2_patched import process_stripe_webhook as event_driven
+from target_app.models import User, Subscription
+from target_app.schemas import StripeEvent
+
+def process_stripe_webhook(session, raw_body, sig_header):
+    result = event_driven(session, raw_body, sig_header)
+    event = StripeEvent.model_validate_json(raw_body)
+    with session.begin():
+        user = session.scalar(select(User).where(
+            User.stripe_customer_id == event.data.object["customer"]))
+        user.plan_tier = "canceled"
+        for sub in session.scalars(select(Subscription).where(Subscription.user_id == user.id)):
+            sub.status = "canceled"
+    return result
+'''
+
+
+@pytest.fixture(scope='module')
+def semantic_controls():
+    from chaoshook_engine.patcher import qualify_semantic_candidate
+    return {name: qualify_semantic_candidate(code) for name, code in (
+        ('prepared', Path(v2_patched.__file__).read_bytes().decode()),
+        ('probe', HARDCODED_CANCELLATION_PROBE),
+    )}
+
+
+def test_semantic_positive_control_exact_coverage_and_preserved_source(semantic_controls):
+    from hashlib import sha256
+    manifest = semantic_controls['prepared']
+    assert sha256(Path(v2_patched.__file__).read_bytes()).hexdigest() == 'a7a480c713d09c0bf8d73d6239138700dcd7cb66b8802cd3715ba8455a9d1694'
+    assert manifest['runtime_acceptance']['accepted']
+    assert manifest['executed_schedule_count'] == 27  # Legacy scope only.
+    assert manifest['strict_qualification']['qualified']
+    strict = manifest['strict_semantic']
+    assert strict['contract_identifier'] == 'novacloud-causal-counterfactual-v1'
+    assert strict['executed_schedule_count'] == 62
+    assert strict['executed_check_count'] == strict['passed_check_count'] == 526
+    assert [(r['scenario_id'], r['executed_schedule_count'], r['executed_check_count']) for r in strict['runs']] == [
+        ('A-canceled', 24, 216), ('B-active', 6, 42), ('C-active-no-invoice', 2, 10),
+        ('C-canceled-no-invoice', 6, 42), ('D-two-invoices', 24, 216),
+    ]
+    for run in strict['runs']:
+        assert run['passed']
+        for schedule in run['schedules']:
+            count = len(schedule['event_ids'])
+            assert [c['id'] for c in schedule['checks']] == ['prefix:0'] + [
+                item for i in range(1, count + 1) for item in (f'prefix:{i}', f'prefix:{i}:duplicate')]
+            assert all(c['passed'] for c in schedule['checks'])
+
+
+def test_evaluator_probe_accepted_by_old_gate_rejected_for_cancellation(semantic_controls):
+    from chaoshook_engine.patcher import evaluate_candidate_patch
+    manifest = semantic_controls['probe']
+    assert manifest['runtime_acceptance']['accepted']
+    assert len(manifest['runtime_acceptance']['run']['passed_check_ids']) == 27
+    evaluation = evaluate_candidate_patch(HARDCODED_CANCELLATION_PROBE)
+    assert sum(r['prover_report']['passed_cells'] for r in evaluation['evaluations']) == 81
+    assert not manifest['strict_qualification']['qualified']
+    strict = manifest['strict_semantic']
+    assert strict['executed_check_count'] == 526
+    checks = [c for r in strict['runs'] for s in r['schedules'] for c in s['checks']]
+    assert all(not c['execution_errors'] for c in checks)
+    active = next(r for r in strict['runs'] if r['scenario_id'] == 'B-active')
+    for schedule in active['schedules']:
+        final = schedule['checks'][-1]
+        assert not final['passed']
+        assert set(final['business_property_violations']) == {'users.plan_tier', 'subscriptions.status'}
+
+
+def test_semantic_contract_independent_prefix_outcomes():
+    from chaoshook_engine.fixtures import semantic_challenges
+    from chaoshook_engine.scenario_spec import semantic_expected_state
+    scenario, challenges = semantic_challenges()
+    events = dict(challenges)['D-two-invoices']
+    empty = semantic_expected_state(scenario, [])
+    assert empty['subscriptions'] == empty['ledger'] == empty['outbox'] == []
+    invoices_only = semantic_expected_state(scenario, events[2:])
+    assert invoices_only['subscriptions'] == invoices_only['outbox'] == []
+    assert {r['invoice_id'] for r in invoices_only['ledger']} == {e['data']['object']['id'] for e in events[2:]}
+    user = next(u for u in invoices_only['users'] if u['id'] == scenario.user_id)
+    assert user['credit_balance'] == scenario.initial_credit_balance + 200
+    assert user['plan_tier'] == 'free'
+    canceled = semantic_expected_state(scenario, dict(challenges)['C-canceled-no-invoice'])
+    assert canceled['ledger'] == []
+    assert canceled['subscriptions'][0]['status'] == 'canceled'
+
+
+def test_semantic_cli_deterministic_and_import_failure(tmp_path, monkeypatch, capsys):
+    from chaoshook_engine import cli
+    def no_muse(*args, **kwargs):
+        pytest.fail('semantic qualification must not use Muse')
+    monkeypatch.setattr(cli, 'MuseNeuroSymbolicClient', no_muse)
+    path = tmp_path / 'semantic.json'
+    args = ['qualify-semantic', '--source', v2_patched.__file__, '--manifest', str(path)]
+    assert cli.main(args) == 0
+    first = path.read_bytes()
+    assert cli.main(args) == 0
+    assert path.read_bytes() == first
+    broken = tmp_path / 'broken.py'
+    broken.write_text('raise ImportError("private-semantic-error")')
+    assert cli.main(['qualify-semantic', '--source', str(broken), '--manifest', str(path)]) == 1
+    evidence = json.loads(path.read_text())
+    assert evidence['strict_semantic']['executed_check_count'] == 0
+    assert not evidence['strict_qualification']['qualified']
+    assert 'private-semantic-error' not in path.read_text() + capsys.readouterr().out
+
+
+def test_opt_in_strict_install_rejects_probe_before_writing(monkeypatch):
+    from chaoshook_engine import patcher
+    installed = []
+    monkeypatch.setattr(patcher, '_install', lambda code: installed.append(code))
+    with pytest.raises(ValueError, match='strict semantic'):
+        patcher.apply_patch_to_active(HARDCODED_CANCELLATION_PROBE, require_strict_semantic=True)
+    assert installed == []
+    source = Path(v2_patched.__file__).read_text()
+    patcher.apply_patch_to_active(source, require_strict_semantic=True)
+    assert installed == [source]
