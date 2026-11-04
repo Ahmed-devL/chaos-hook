@@ -1,0 +1,21 @@
+{
+  "modes": [
+    {
+      "completed_trials": 0,
+      "live_fully_qualified_successes": 0,
+      "live_legacy_successes": 0,
+      "live_trials": 0,
+      "recorded_trials": 0,
+      "synthesis_mode": "guided"
+    },
+    {
+      "completed_trials": 3,
+      "live_fully_qualified_successes": 3,
+      "live_legacy_successes": 3,
+      "live_trials": 3,
+      "recorded_trials": 3,
+      "synthesis_mode": "contract-driven"
+    }
+  ],
+  "schema_version": 1
+}

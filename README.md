@@ -446,8 +446,35 @@ its original prompts, request formatting, credential handling and verified cache
 The separate `synthesis-experiment` command measures whether Wonder can produce
 a repair from business obligations and execution evidence without the guided
 repair recipe. It never installs a candidate and never substitutes cached code.
-No live trials were performed during implementation; mocked tests are not a
-measured live success rate.
+
+### Live Contract-Driven Muse Experiment
+
+Following implementation of the contract-driven synthesis workflow, three live experiments were conducted on November 4, 2026, using `muse-wonder-1.0`.
+
+All three trials succeeded on their first attempt, with cached fallback disabled.
+
+| Metric | Observed result |
+|---|---|
+| Live trials | 3 |
+| Successful legacy verifications | 3/3 (27/27 checks per candidate) |
+| Successful strict qualifications | 3/3 (526/526 checks per candidate) |
+| Model requests | 3 |
+| Cached fallback occurrences | 0 |
+| CEGIS retry rounds | 0 |
+
+The three model-generated candidates had distinct source hashes:
+
+- Trial 1: `46b34e38ce29d8d2…`
+- Trial 2: `addc75f67c58917f…`
+- Trial 3: `5e71ab64134b4da8…`
+
+An independent AI-assisted technical audit retrieved the retained candidate sources, verified their hashes and prompt provenance, and reproduced all three verification results against the audited repository commit.
+
+The live experiment was conducted after the implementation tests. The original guided synthesis workflow remains the default graphical workflow; these results came from the separate, opt-in contract-driven experiment.
+
+These results demonstrate successful synthesis against the configured synthetic contract. They do not establish generalization to arbitrary webhook applications, cryptographic attestation of provider provenance, or a measured success rate across independent tasks.
+
+**Reproducibility:** The experiment journal and comparison artifacts are available in `docs/experiments/contract_driven_3trials/`. The results are historical and tied to the candidate hashes and verifier version used during the experiment; subsequent changes to the prepared reference handler do not retroactively alter them.
 
 For a controlled **three-trial** experiment, configure the existing private
 `MUSE_API_KEY`, `MUSE_BASE_URL`, and `MUSE_WONDER_MODEL` settings, then run:
