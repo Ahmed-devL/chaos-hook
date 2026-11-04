@@ -555,3 +555,255 @@ class MuseNeuroSymbolicClient:
                 wonder["patched_code"],
             ),
         }
+
+
+# Experimental prompts are deliberately separate from every guided template,
+# invariant description, Spark diagnosis, and repeated handler_contract string.
+CONTRACT_DRIVEN_PROMPT = """Repair the supplied webhook module to satisfy the supplied
+business contract. Return strict JSON with patched_code containing a complete
+importable Python module defining process_stripe_webhook(session, raw_body,
+sig_header) -> dict. Choose the implementation yourself. The execution feedback
+reports observations, not instructions. Do not import example handlers, engine
+modules, or tests, or read repository files at runtime. Use only Python's standard
+library, SQLAlchemy, and the supplied public target_app interfaces. No network,
+external services, schema changes, or asynchronous database access are available.
+Preserve signature verification. Return candidate code only in patched_code."""
+
+
+def experiment_contract_payload():
+    """Business facts and public interfaces, without a repair implementation.
+
+    Schema column names (including last_event_ts) are available facts. No advice
+    about how to use them is supplied. Expected outcomes come from the independent
+    contract, never from running the prepared handler.
+    """
+    from chaoshook_engine.fixtures import semantic_challenges
+    from chaoshook_engine.scenario_spec import (
+        SCENARIO_SPEC, SEMANTIC_CONTRACT_ID, semantic_expected_state,
+    )
+    scenario, histories = semantic_challenges()
+    return {
+        "schema_code": (HANDLER_DIR.parent / "models.py").read_text(encoding="utf-8"),
+        "handler_code": (HANDLER_DIR / "v1_vulnerable.py").read_text(encoding="utf-8"),
+        "public_interface": {
+            "entrypoint": "process_stripe_webhook(session, raw_body: bytes, sig_header: str) -> dict",
+            "session": "Synchronous SQLAlchemy Session using SQLite; caller rolls back on exceptions.",
+            "signature": "target_app.hmac_auth.verify_stripe_signature(raw_body, sig_header) -> bool",
+            "event_schema": (HANDLER_DIR.parent / "schemas.py").read_text(encoding="utf-8"),
+            "welcome": "target_app.side_effects.send_welcome_email(session, user_id, dedupe_key=None) queues one welcome_pro OutboxEmail row without committing.",
+        },
+        "business_contract": {
+            "legacy_identifier": "novacloud-four-event-lifecycle-v1",
+            "legacy_specification": asdict(SCENARIO_SPEC),
+            "strict_identifier": SEMANTIC_CONTRACT_ID,
+            "behavior": [
+                "Checkout permits pro access and exactly one welcome message for the relevant account.",
+                "Subscription creation means active/pro; deletion means canceled. With no deletion, cancellation must not be invented.",
+                "When delivered lifecycle facts disagree, the fact with greatest synthetic created timestamp determines the plan. Subscription status depends only on delivered subscription facts. Period end is the greatest delivered subscription period end.",
+                "Each distinct eligible paid invoice contributes exactly 100 credits and one ledger row attributed to its actual invoice and account. Invoice payment does not change lifecycle state.",
+                "Without a paid invoice, balance remains initial balance and no invoice ledger row exists, including after cancellation.",
+                "At every event prefix, only delivered facts justify effects. No checkout means no welcome; no subscription fact means no subscription row.",
+                "Duplicate deliveries must not repeat business effects. Crash followed by retry must recover the required outcome.",
+                "Preserve other accounts and entity attribution. Preserve initial balances when adding credits.",
+                "Distinct created timestamps are authoritative only in this synthetic contract, not a Stripe ordering guarantee.",
+            ],
+            "histories": [{"id": name, "initial_users": scenario.initial_users(),
+                           "events": events, "expected_final": semantic_expected_state(scenario, events)}
+                          for name, events in histories],
+            "evaluation": "Legacy: 24 permutations, one duplicate race, two crash/retries. Strict: all permutations of supplied histories, every prefix and immediate duplicate, including initial state.",
+        },
+    }
+
+
+def experiment_feedback(evidence):
+    """Only observed property names, schedule IDs and sanitized error codes."""
+    base = evidence["runtime_acceptance"]["run"]
+    strict = evidence["strict_semantic"]
+    return {
+        "legacy": {key: deepcopy(base[key]) for key in (
+            "passed_check_ids", "failed_check_ids", "business_property_violations",
+            "execution_errors", "synchronization_errors", "import_error", "verification_error")},
+        "strict": {"contract_identifier": strict["contract_identifier"],
+                   "qualified": strict["qualified"],
+                   "executed_check_count": strict["executed_check_count"],
+                   "error": strict.get("error"),
+                   "scenarios": [{"id": run["scenario_id"], "passed": run["passed"],
+                                  "failed_checks": [
+                                      {"schedule_id": schedule["id"], "event_ids": schedule["event_ids"], **check}
+                                      for schedule in run["schedules"] for check in schedule["checks"] if not check["passed"]
+                                  ][:12]}
+                                 for run in strict["runs"]]},
+        "sampling": "Strict feedback shows first 12 failing checkpoints per scenario; complete evidence is retained.",
+    }
+
+
+def summarize_synthesis_experiments(experiments):
+    """Compare only actual retained trials, using all requested slots as denominator."""
+    rows = []
+    for mode in ("guided", "contract-driven"):
+        records = [(run, trial) for run in experiments if run["synthesis_mode"] == mode
+                   for trial in run["trials"]]
+        live = [(run, trial) for run, trial in records if run["run_kind"] == "live"]
+        rows.append({
+            "synthesis_mode": mode, "recorded_trials": len(records), "live_trials": len(live),
+            "completed_trials": sum(trial["status"] != "pending" and trial["status"] != "running"
+                                    for _, trial in records),
+            "live_legacy_successes": sum(trial.get("legacy_passed", False) and not trial["fallback_occurred"]
+                                         for _, trial in live),
+            "live_fully_qualified_successes": sum(trial.get("fully_qualified", False) and not trial["fallback_occurred"]
+                                                  for _, trial in live),
+        })
+    lines = ["Synthesis experiment comparison", "", "All requested trials are retained; no failure-only retries.", ""]
+    for row in rows:
+        mode, count = row["synthesis_mode"], row["live_trials"]
+        lines.append(f"{mode}: {row['recorded_trials']} recorded trials; " + (
+            f"{row['live_legacy_successes']}/{count} live legacy successes; "
+            f"{row['live_fully_qualified_successes']}/{count} live fully qualified successes."
+            if count else "no live trials recorded; success rate not evaluated."))
+    lines.extend(["", "Mocked records are implementation tests, not live success evidence.",
+                  "Guided experiment trials use the existing guided prompt; the default demo workflow is unchanged.",
+                  "Finite public contracts and temperature 0 do not establish generalization or statistical independence."])
+    return {"schema_version": 1, "modes": rows}, "\n".join(lines) + "\n"
+
+
+def run_synthesis_experiment(out, *, trials, synthesis_mode="contract-driven", max_attempts=2,
+                             run_kind="live", client_factory=MuseNeuroSymbolicClient):
+    """Explicit opt-in trials; no fallback, installation, or cross-trial feedback.
+
+    The fresh output directory reserves the full trial denominator before any
+    request. Requests/responses are journaled before evaluation. Interrupted slots
+    stay pending/running and cannot disappear from the recorded trial count.
+    Guided *experiment* uses the exact guided initial messages; its evaluation
+    and stop policy match contract-driven trials, not the default demo workflow.
+    """
+    from chaoshook_engine.patcher import qualify_semantic_candidate
+
+    if type(trials) is not int or trials < 1 or type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("Explicit positive trial and attempt counts are required")
+    if synthesis_mode not in {"guided", "contract-driven"} or run_kind not in {"live", "mocked"}:
+        raise ValueError("Invalid synthesis mode or run kind")
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=False)  # Refuse to erase prior failures.
+    baseline_source = (HANDLER_DIR / "v1_vulnerable.py").read_text(encoding="utf-8")
+    record = {"schema_version": 1, "synthesis_mode": synthesis_mode, "run_kind": run_kind,
+              "requested_trial_count": trials, "max_attempts_per_trial": max_attempts,
+              "status": "running", "fallback_policy": "disabled_no_cached_candidates",
+              "trials": [{"trial": i, "status": "pending", "fallback_occurred": False,
+                          "legacy_passed": False, "fully_qualified": False, "attempts": []}
+                         for i in range(1, trials + 1)]}
+
+    def persist():
+        # Replace complete JSON documents atomically, retaining interrupted slots.
+        for name, value in (("trials.json", record),
+                            ("comparison.json", summarize_synthesis_experiments([record])[0])):
+            temporary = out / (name + ".tmp")
+            temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            temporary.replace(out / name)
+        (out / "comparison.md").write_text(summarize_synthesis_experiments([record])[1], encoding="utf-8")
+
+    persist()
+    # Baseline evidence is from real executions. No prepared code is opened here.
+    baseline = qualify_semantic_candidate(baseline_source)
+    record["baseline_evidence"] = baseline
+    payload_template = experiment_contract_payload()
+    for trial in record["trials"]:
+        trial["status"] = "running"
+        persist()
+        client = client_factory()  # Fresh client and conversation for every trial.
+        feedback = experiment_feedback(baseline)
+        candidate_source = baseline_source
+        for number in range(1, max_attempts + 1):
+            attempt = {"attempt": number, "synthesis_mode": synthesis_mode, "status": "requesting",
+                       "requested_model_identifier": client.safe_error(client.wonder_model),
+                       "actual_model_identifier": None, "candidate_sha256": None,
+                       "fallback_occurred": False, "base_verification": None,
+                       "strict_semantic": None, "fully_qualified": False}
+            trial["attempts"].append(attempt)
+            if synthesis_mode == "contract-driven":
+                prompt = CONTRACT_DRIVEN_PROMPT
+                payload = {**deepcopy(payload_template), "handler_code": candidate_source, "execution_feedback": feedback}
+            else:
+                prompt = WONDER_PROMPT
+                if number > 1:
+                    prompt += ("\nRepair your own previous patch in handler_code using the "
+                               "remaining counterexamples and import_error in prover_report. "
+                               "Return the same strict JSON contract.")
+                if number == 1:
+                    # Same input projection as _request for default guided synthesis.
+                    from chaoshook_engine.runner import run_algebraic_prover
+                    from target_app.handlers import v1_vulnerable
+                    view = counterexample_view(run_algebraic_prover(v1_vulnerable.process_stripe_webhook))
+                else:
+                    # Both experimental modes receive actual strict failure feedback.
+                    view = feedback
+                payload = {"schema_code": payload_template["schema_code"], "handler_code": candidate_source,
+                           "prover_report": view,
+                           "handler_contract": "process_stripe_webhook(session, raw_body, sig_header) -> dict\n" + WONDER_PROMPT.split(
+                               "The handler_contract is an interface description:", 1)[1].strip()}
+            body = {"model": client.wonder_model, "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                    "messages": [{"role": "system", "content": prompt},
+                                 {"role": "user", "content": client.safe_error(json.dumps(payload))}]}
+            attempt["request"] = json.loads(client.safe_error(json.dumps(body)))
+            persist()
+            try:
+                key = client.api_key.lower()
+                if (client.force_cache or not key or not client.base_url
+                        or key in {"none", "null", "changeme", "placeholder", "test", "dummy"}
+                        or any(marker in key for marker in ("your_", "your-", "replace", "example", "placeholder", "<", ">"))):
+                    attempt["status"] = "configuration_blocked"
+                    break
+                response = client.api_request("POST", "chat/completions", json=body)
+                attempt["response"] = json.loads(client.safe_error(json.dumps(response)))
+                model = response.get("model")
+                attempt["actual_model_identifier"] = client.safe_error(model) if isinstance(model, str) else None
+                attempt["finish_reason"] = response.get("choices", [{}])[0].get("finish_reason")
+                attempt["provenance"] = "live_model_response"
+                attempt["status"] = "response_received"
+                persist()
+                content = response["choices"][0]["message"]["content"].strip()
+                content = re.sub(r"^```(?:json)?\s*\n?", "", content, count=1, flags=re.IGNORECASE)
+                content = re.sub(r"\s*```$", "", content)
+                candidate = json.loads(content)
+                candidate_source = candidate.get("patched_code")
+                if not isinstance(candidate_source, str) or not candidate_source.strip():
+                    raise ValueError("missing_candidate_source")
+                attempt["candidate_sha256"] = sha256(candidate_source.encode("utf-8")).hexdigest()
+                attempt["candidate_source"] = client.safe_error(candidate_source)
+                attempt["candidate_source_redacted"] = attempt["candidate_source"] != candidate_source
+                attempt["status"] = "evaluating"
+                persist()
+                evidence = qualify_semantic_candidate(candidate_source)
+                # The normal offline qualifier defaults to prepared provenance.
+                # Here provenance is established by this retained API response.
+                evidence["candidate"].update(provenance="live_model_response",
+                                             provenance_basis="retained_experimental_response")
+                attempt["evidence"] = evidence
+                attempt["base_verification"] = evidence["runtime_acceptance"]
+                attempt["strict_semantic"] = {key: evidence["strict_semantic"][key] for key in (
+                    "contract_identifier", "executed_schedule_count", "executed_check_count", "passed_check_count", "qualified")}
+                attempt["fully_qualified"] = evidence["strict_qualification"]["qualified"]
+                feedback = experiment_feedback(evidence)
+                attempt["feedback"] = feedback
+                attempt["status"] = "qualified" if attempt["fully_qualified"] else "rejected"
+                # A trial's result is its final produced candidate, not an OR
+                # over earlier candidates. Keep earlier legacy-only passes intact.
+                trial["legacy_passed"] = evidence["runtime_acceptance"]["accepted"]
+                trial["fully_qualified"] = attempt["fully_qualified"]
+                persist()
+                if trial["fully_qualified"]:
+                    break
+            except Exception as exc:
+                # Do not copy exception messages or parser documents into feedback.
+                attempt["error_code"] = type(exc).__name__
+                attempt["status"] = "errored"
+                break  # No invisible transport retries or favorable-trial replacement.
+            finally:
+                persist()
+        trial["status"] = ("qualified" if trial["fully_qualified"] else
+                           "exhausted" if trial["attempts"][-1]["status"] == "rejected"
+                           else trial["attempts"][-1]["status"])
+        persist()
+    record["status"] = "completed"
+    persist()
+    return record

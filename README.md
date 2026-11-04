@@ -438,3 +438,105 @@ For `live-patch-check`, disable cache mode; it synthesizes and verifies a candid
 ## License
 
 MIT License. Copyright (c) 2026 Kyoka Suigetsu. See [LICENSE](LICENSE).
+
+## Opt-in contract-driven synthesis experiment
+
+The guided dashboard/CEGIS path remains the default demonstration path, with
+its original prompts, request formatting, credential handling and verified cache.
+The separate `synthesis-experiment` command measures whether Wonder can produce
+a repair from business obligations and execution evidence without the guided
+repair recipe. It never installs a candidate and never substitutes cached code.
+No live trials were performed during implementation; mocked tests are not a
+measured live success rate.
+
+For a controlled **three-trial** experiment, configure the existing private
+`MUSE_API_KEY`, `MUSE_BASE_URL`, and `MUSE_WONDER_MODEL` settings, then run:
+
+```bash
+DEMO_FALLBACK_CACHE=false .venv/bin/python -m chaoshook_engine.cli synthesis-experiment \
+  --synthesis-mode contract-driven --trials 3 --max-attempts 2 \
+  --out /tmp/chaoshook-contract-three
+```
+
+This explicitly authorizes up to **six billable model requests**: three fresh
+trials with at most two bounded CEGIS attempts each. A fully qualified candidate
+ends its trial early. Transport, configuration or malformed-response errors end
+the current trial, retain its output, and advance to the next reserved trial.
+There are no hidden transport retries or replacements for failed trials. Forced
+cache configuration blocks experiments and is recorded as unsuccessful rather
+than used as live evidence. The output directory must be fresh; an existing
+experiment is never overwritten. Temperature remains 0, so independent sessions
+can produce identical output; these are not guaranteed statistically independent
+samples. There is no runtime attempt budget beyond the explicit attempt count
+and existing per-request timeout.
+
+Optional guided-prompt comparison, with an equal predeclared trial budget:
+
+```bash
+DEMO_FALLBACK_CACHE=false .venv/bin/python -m chaoshook_engine.cli synthesis-experiment \
+  --synthesis-mode guided --trials 3 --max-attempts 2 \
+  --out /tmp/chaoshook-guided-three
+
+.venv/bin/python -m chaoshook_engine.cli compare-synthesis \
+  --record /tmp/chaoshook-contract-three/trials.json \
+  --record /tmp/chaoshook-guided-three/trials.json \
+  --out /tmp/chaoshook-synthesis-comparison
+```
+
+The guided **experiment** uses the existing guided system prompt and repeated
+interface instructions; its first request uses the same guided payload projection.
+Both experimental arms use the same strict verification stop condition and
+predeclared attempt cap, and both disable fallback. Subsequent guided experimental
+attempts also receive strict execution feedback. This comparison evaluates prompt
+conditions under this harness, not the default guided workflow's cache or its
+legacy-only stopping rule. The default guided workflow itself is unchanged.
+Comparison makes no model calls. With records from only one mode, the other is
+reported as not evaluated; external historical success claims are not added to
+the denominator. Mocked records are excluded from live success counts.
+
+Each experiment writes:
+
+- `trials.json`: all preallocated trial slots, completion status, mode, configured
+  and actual response model identifiers (null if not supplied), every request and
+  sanitized response, attempt number, completion reason, source/hash, fallback
+  flag, independent base and strict outcomes, full verification manifests and
+  bounded sanitized feedback. Candidate hashes bind the exact evaluated source;
+  if redaction changes retained source, `candidate_source_redacted` records that.
+- `comparison.json` and `comparison.md`: machine-readable counts and a readable
+  comparison based exclusively on the retained trials. All requested slots count,
+  including unsuccessful and interrupted ones. Partial journals retain pending
+  or running states; a new command requires a new directory. Keep all original
+  experiment records when making a combined comparison.
+
+Contract-driven prompts are built separately from `WONDER_PROMPT`, its repeated
+`handler_contract`, Spark diagnoses, cache invariant descriptions and guided retry
+instructions. They include the vulnerable module, public entry point, schema and
+payload interface, welcome helper interface, independently specified outcomes,
+actual execution failures, and import/runtime constraints. Schema facts such as
+the `last_event_ts` columns remain visible, but no advice about how to use them is
+supplied. The contract describes which delivered lifecycle fact wins under its
+synthetic timestamps; it does not prescribe a storage or merge algorithm. No
+reference source or successful candidate is provided as an example. A retry sees
+only its own preceding candidate and real verifier feedback, never another
+trial's output. Strict feedback is capped at 12 failing checkpoints per history;
+complete results remain in the recorded evidence.
+
+Every generated nonempty candidate source is imported and evaluated through the
+existing independent qualifier against both the unchanged legacy **27-cell**
+gate and `novacloud-causal-counterfactual-v1` (**62 schedules / 526 checks** when
+fully executed). Import failures are retained with zero executed semantic checks.
+Legacy acceptance and strict qualification are recorded separately. A 27/27
+candidate that fails strict semantics remains rejected for full qualification,
+and its actual defect evidence is retained. No candidate is automatically
+installed. In this experiment, retained API responses establish live-response
+provenance; fallback never establishes live success. An absent response model ID
+remains unknown rather than being replaced with the requested ID.
+
+Implementation regression tests use mocked responses to cover an unsuccessful
+partial repair followed by a qualified repair, a legacy-passing hardcoded
+cancellation candidate rejected by strict semantics, independent three-trial
+retention, malformed responses, import errors, credential redaction, offline
+blocking, prompt separation and comparison accounting. They do not establish
+Muse's live experimental repair capability. Neither verification contract nor
+the prepared reference is changed for this experiment. Bounded public-contract
+success is not general correctness or evidence of held-out generalization.

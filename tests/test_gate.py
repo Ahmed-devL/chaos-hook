@@ -2242,3 +2242,149 @@ def test_opt_in_strict_install_rejects_probe_before_writing(monkeypatch):
     source = Path(v2_patched.__file__).read_text()
     patcher.apply_patch_to_active(source, require_strict_semantic=True)
     assert installed == [source]
+
+
+def _experiment_client(monkeypatch, responses):
+    from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
+    monkeypatch.setenv('MUSE_API_KEY', 'experiment-secret')
+    monkeypatch.setenv('MUSE_BASE_URL', 'https://experiment.invalid/v1')
+    monkeypatch.setenv('DEMO_FALLBACK_CACHE', 'false')
+    pending = iter(responses)
+    requests = []
+    def request(self, method, path, **kwargs):
+        requests.append(kwargs['json'])
+        result = next(pending)
+        if isinstance(result, Exception):
+            raise result
+        return {'model': 'actual-response-model', 'choices': [{'finish_reason': 'stop', 'message': {
+            'content': json.dumps({'patched_code': result})}}]}
+    monkeypatch.setattr(MuseNeuroSymbolicClient, 'api_request', request)
+    return requests
+
+
+def test_contract_driven_prompt_separation_and_actual_dual_verification(monkeypatch, tmp_path):
+    from chaoshook_engine.muse_client import run_synthesis_experiment, CONTRACT_DRIVEN_PROMPT, WONDER_PROMPT
+    partial = Path(v2_patched.__file__).with_name('v1_partial_idempotent.py').read_text()
+    prepared = Path(v2_patched.__file__).read_text()
+    requests = _experiment_client(monkeypatch, [partial, prepared])
+    # No prepared source can be read as a fallback or hidden example.
+    original_read = Path.read_text
+    def read(path, *args, **kwargs):
+        if path.name == 'v2_patched.py':
+            pytest.fail('experiment must not read the reference handler')
+        return original_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', read)
+    result = run_synthesis_experiment(tmp_path / 'trial', trials=1, run_kind='mocked')
+    trial = result['trials'][0]
+    assert trial['fully_qualified'] and len(trial['attempts']) == 2
+    for request in requests:
+        assert request['temperature'] == 0
+        assert request['response_format'] == {'type': 'json_object'}
+        assert request['messages'][0]['content'] == CONTRACT_DRIVEN_PROMPT
+        assert WONDER_PROMPT not in json.dumps(request)
+        payload = json.loads(request['messages'][1]['content'])
+        assert 'handler_contract' not in payload
+        assert 'sql_trace' not in json.dumps(payload)
+        # Schema facts are allowed. No strategy prescriptions in either template.
+        text = json.dumps({k: v for k, v in payload.items() if k not in {'schema_code', 'handler_code'}}).lower()
+        for forbidden in ('claim-first', 'on conflict', 'rowcount', 'tombstone', 'monotonic', 'watermark',
+                          'single transaction', 'no intermediate commits'):
+            assert forbidden not in text + CONTRACT_DRIVEN_PROMPT.lower()
+        assert prepared not in json.dumps(payload)
+        assert payload['business_contract']['strict_identifier'] == 'novacloud-causal-counterfactual-v1'
+        assert 'last_event_ts' in payload['schema_code']  # Available schema, not usage advice.
+    attempts = trial['attempts']
+    assert attempts[0]['base_verification']['run']['passed_check_ids'].__len__() == 9
+    assert not attempts[0]['strict_semantic']['qualified']
+    assert attempts[1]['strict_semantic']['passed_check_count'] == 526
+    assert attempts[1]['strict_semantic']['executed_schedule_count'] == 62
+    assert all(a['actual_model_identifier'] == 'actual-response-model' for a in attempts)
+    assert attempts[1]['evidence']['candidate']['provenance'] == 'live_model_response'
+    assert attempts[1]['finish_reason'] == 'stop'
+    second = json.loads(requests[1]['messages'][1]['content'])
+    assert second['handler_code'] == partial
+    assert second['execution_feedback'] == attempts[0]['feedback']
+    persisted = json.loads((tmp_path / 'trial/trials.json').read_text())
+    assert persisted == result
+    comparison = json.loads((tmp_path / 'trial/comparison.json').read_text())
+    assert all(row['live_fully_qualified_successes'] == 0 for row in comparison['modes'])
+
+
+def test_experiment_retains_three_independent_trials_and_semantic_defect(monkeypatch, tmp_path):
+    from hashlib import sha256
+    from chaoshook_engine.muse_client import run_synthesis_experiment
+    requests = _experiment_client(monkeypatch, [HARDCODED_CANCELLATION_PROBE,
+                                                RuntimeError('experiment-secret'),
+                                                Path(v2_patched.__file__).read_text()])
+    active = Path(v2_patched.__file__).with_name('active_handler.py')
+    before = active.read_bytes()
+    result = run_synthesis_experiment(tmp_path / 'three', trials=3, max_attempts=1, run_kind='mocked')
+    assert result['requested_trial_count'] == len(result['trials']) == len(requests) == 3
+    assert [t['status'] for t in result['trials']] == ['exhausted', 'errored', 'qualified']
+    first = result['trials'][0]['attempts'][0]
+    assert first['candidate_sha256'] == sha256(HARDCODED_CANCELLATION_PROBE.encode()).hexdigest()
+    assert first['base_verification']['accepted']
+    assert not first['strict_semantic']['qualified'] and not first['fully_qualified']
+    assert first['feedback']['strict']['scenarios']
+    for request in requests:
+        assert json.loads(request['messages'][1]['content'])['handler_code'] == Path(v1_vulnerable.__file__).read_text()
+    assert active.read_bytes() == before
+    assert 'experiment-secret' not in (tmp_path / 'three/trials.json').read_text()
+    assert all(not t['fallback_occurred'] for t in result['trials'])
+    with pytest.raises(FileExistsError):
+        run_synthesis_experiment(tmp_path / 'three', trials=3)
+
+
+def test_experiment_guided_prompt_comparison_and_no_fallback(monkeypatch, tmp_path):
+    from chaoshook_engine.muse_client import run_synthesis_experiment, WONDER_PROMPT, summarize_synthesis_experiments
+    requests = _experiment_client(monkeypatch, [Path(v2_patched.__file__).read_text()])
+    guided = run_synthesis_experiment(tmp_path / 'guided', trials=1, synthesis_mode='guided', max_attempts=1, run_kind='mocked')
+    assert requests[0]['messages'][0]['content'] == WONDER_PROMPT
+    payload = json.loads(requests[0]['messages'][1]['content'])
+    assert payload['handler_contract'].endswith(WONDER_PROMPT.split('The handler_contract is an interface description:', 1)[1].strip())
+    assert guided['trials'][0]['fully_qualified']
+    # Offline configuration is retained as unsuccessful slots; no reference fallback.
+    monkeypatch.setenv('DEMO_FALLBACK_CACHE', 'true')
+    blocked = run_synthesis_experiment(tmp_path / 'blocked', trials=3, max_attempts=1, run_kind='mocked')
+    assert len(requests) == 1
+    assert all(t['status'] == 'configuration_blocked' and not t['fully_qualified'] for t in blocked['trials'])
+    assert all(not t['fallback_occurred'] for t in blocked['trials'])
+    summary, prose = summarize_synthesis_experiments([guided, blocked])
+    assert all(r['live_trials'] == 0 for r in summary['modes'])
+    assert 'success rate not evaluated' in prose
+
+
+def test_experiment_malformed_and_import_error_retained(monkeypatch, tmp_path):
+    from chaoshook_engine.muse_client import run_synthesis_experiment, MuseNeuroSymbolicClient
+    _experiment_client(monkeypatch, [])
+    outputs = iter(['{malformed', json.dumps({'patched_code': 'raise ImportError("experiment-secret")'})])
+    def request(*args, **kwargs):
+        return {'choices': [{'message': {'content': next(outputs)}}]}
+    monkeypatch.setattr(MuseNeuroSymbolicClient, 'api_request', request)
+    result = run_synthesis_experiment(tmp_path / 'bad', trials=2, max_attempts=1, run_kind='mocked')
+    first, second = [t['attempts'][0] for t in result['trials']]
+    assert first['status'] == 'errored' and first['response']
+    assert first['actual_model_identifier'] is None
+    assert second['status'] == 'rejected'
+    assert second['base_verification']['run']['import_error'] == 'candidate_import_error'
+    assert second['strict_semantic']['executed_check_count'] == 0
+    assert not second['fully_qualified']
+    assert 'experiment-secret' not in json.dumps(result)
+
+
+def test_experiment_cli_count_required_and_recorded_comparison(monkeypatch, tmp_path, capsys):
+    from chaoshook_engine import cli
+    with pytest.raises(SystemExit):
+        cli.main(['synthesis-experiment', '--out', str(tmp_path / 'missing')])
+    _experiment_client(monkeypatch, [])
+    monkeypatch.setenv('DEMO_FALLBACK_CACHE', 'true')
+    out = tmp_path / 'blocked'
+    assert cli.main(['synthesis-experiment', '--trials', '3', '--max-attempts', '1', '--out', str(out)]) == 1
+    manifest = json.loads((out / 'trials.json').read_text())
+    assert len(manifest['trials']) == 3 and manifest['status'] == 'completed'
+    assert cli.main(['compare-synthesis', '--record', str(out / 'trials.json'), '--out', str(tmp_path / 'compare')]) == 0
+    summary = json.loads((tmp_path / 'compare/comparison.json').read_text())
+    row = next(r for r in summary['modes'] if r['synthesis_mode'] == 'contract-driven')
+    assert row['live_trials'] == row['recorded_trials'] == 3
+    assert row['live_legacy_successes'] == row['live_fully_qualified_successes'] == 0
+    assert 'experiment-secret' not in capsys.readouterr().out

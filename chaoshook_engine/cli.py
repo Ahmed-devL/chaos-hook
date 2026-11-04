@@ -269,12 +269,44 @@ def main(argv=None) -> int:
     semantic = commands.add_parser("qualify-semantic", help="Strict causal/counterfactual qualification; no Muse or install")
     semantic.add_argument("--source", type=Path, required=True)
     semantic.add_argument("--manifest", type=Path)
+    experiment = commands.add_parser("synthesis-experiment", help="Opt-in billable Muse trials; no fallback or installation")
+    experiment.add_argument("--synthesis-mode", choices=("contract-driven", "guided"), default="contract-driven")
+    experiment.add_argument("--trials", type=int, required=True)
+    experiment.add_argument("--max-attempts", type=int, default=2)
+    experiment.add_argument("--out", type=Path, required=True, help="Fresh directory; existing outputs are never replaced")
+    comparison = commands.add_parser("compare-synthesis", help="Compare recorded experiments without model calls")
+    comparison.add_argument("--record", type=Path, action="append", required=True)
+    comparison.add_argument("--out", type=Path, required=True, help="Fresh comparison directory")
     demo = commands.add_parser("demo", help="Write deterministic offline baseline and prepared repair evidence")
     demo.add_argument("--out", type=Path, required=True, help="Evidence output directory")
     demo.add_argument("--seed", type=int, action="append", dest="seeds", help="Qualification seeds (default: 101, 202, 303)")
     args = parser.parse_args(argv)
     if args.command == 'preflight':
         return preflight(args.live)
+    if args.command == "synthesis-experiment":
+        from chaoshook_engine.muse_client import run_synthesis_experiment
+        try:
+            result = run_synthesis_experiment(args.out, trials=args.trials, synthesis_mode=args.synthesis_mode,
+                                              max_attempts=args.max_attempts)
+        except (ValueError, FileExistsError) as exc:
+            parser.error(str(exc))
+        print((args.out / "comparison.md").read_text(), end="")
+        return 0 if all(t["fully_qualified"] for t in result["trials"]) else 1
+    if args.command == "compare-synthesis":
+        from chaoshook_engine.muse_client import summarize_synthesis_experiments
+        paths = [path.resolve() for path in args.record]
+        if len(set(paths)) != len(paths):
+            parser.error("Each experiment record must be supplied once")
+        records = [json.loads(path.read_text()) for path in paths]
+        summary, prose = summarize_synthesis_experiments(records)
+        try:
+            args.out.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            parser.error("Comparison output directory must be fresh")
+        (args.out / "comparison.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        (args.out / "comparison.md").write_text(prose)
+        print(prose, end="")
+        return 0
     if args.command == "qualify-semantic":
         from chaoshook_engine.patcher import qualify_semantic_candidate
 
