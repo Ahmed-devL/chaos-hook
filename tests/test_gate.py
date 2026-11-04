@@ -1027,3 +1027,234 @@ def test_failed_evaluation_is_consumed(partial_code):
     history.record_feedback([606])
     result = evaluate_candidate_patch(partial_code, [606, 707], history=history)
     assert [item['label'] for item in result['evaluations']] == ['evaluation', 'held-out']
+
+
+# Phase 4: local candidate defects. These fixtures never install source or change
+# production verification. Seeded cases are regression inputs, not held-out data.
+_MUTATION_SEEDS = (101, 202, 303)
+_MUTATION_NAMES = (
+    'missing_invoice_credit', 'wrong_user_attribution', 'wrong_lifecycle',
+    'missing_welcome_outbox', 'bystander_change',
+)
+
+
+def _mutant_handler(defect):
+    """Compose one explicit defect with a valid local candidate's SQL behavior.
+
+    Corrections run only after a newly processed delivery commits. Expected
+    injected crashes propagate normally; retries perform the defective effect
+    once. SQL writes precede reads to preserve SQLite race-test support.
+    """
+    from sqlalchemy import delete, select, update
+    from target_app.models import CreditLedger, OutboxEmail, Subscription, User
+    from target_app.schemas import StripeEvent
+
+    def candidate(session, raw_body, sig_header):
+        event = StripeEvent.model_validate_json(raw_body)
+        result = v2_patched.process_stripe_webhook(session, raw_body, sig_header)
+        if result['status'] != 'processed':
+            return result
+        obj = event.data.object
+        account = User.stripe_customer_id == obj['customer']
+        owner = select(User.id).where(account).scalar_subquery()
+        bystander = select(User.id).where(
+            User.stripe_customer_id != obj['customer']
+        ).scalar_subquery()
+        with session.begin():
+            if event.type == 'invoice.paid':
+                if defect == 'missing_invoice_credit':
+                    session.execute(update(User).where(account).values(
+                        credit_balance=User.credit_balance - 100))
+                    session.execute(delete(CreditLedger).where(CreditLedger.invoice_id == obj['id']))
+                elif defect == 'wrong_user_attribution':
+                    session.execute(update(User).where(account).values(
+                        credit_balance=User.credit_balance - 100))
+                    session.execute(update(User).where(User.id == bystander).values(
+                        credit_balance=User.credit_balance + 100))
+                    session.execute(update(CreditLedger).where(
+                        CreditLedger.invoice_id == obj['id']).values(user_id=bystander))
+                elif defect == 'bystander_change':
+                    session.execute(update(User).where(User.id == bystander).values(
+                        email='unintended-change@example.com'))
+            elif event.type == 'customer.subscription.deleted' and defect == 'wrong_lifecycle':
+                session.execute(update(Subscription).where(Subscription.id == obj['id']).values(
+                    status='active'))
+            elif event.type == 'checkout.session.completed' and defect == 'missing_welcome_outbox':
+                session.execute(delete(OutboxEmail).where(OutboxEmail.user_id == owner))
+        return result
+
+    return candidate
+
+
+def _mutation_properties(defect, scenario):
+    bystander_id = scenario.initial_users()[1]['id']
+    return {
+        'missing_invoice_credit': {'user.credit_balance', 'credit_ledger_rows', 'credit_ledger_sum'},
+        'wrong_user_attribution': {'user.credit_balance', 'credit_ledger.identity',
+                                   f'users.{bystander_id}.credit_balance'},
+        'wrong_lifecycle': {'subscription.status'},
+        'missing_welcome_outbox': {'user.welcome_email_count', 'outbox_emails_count'},
+        'bystander_change': {f'users.{bystander_id}.email'},
+        'valid_control': set(),
+    }[defect]
+
+
+def _classify_mutation_cell(cell, intended_properties):
+    """Execution failures are never credited as business-contract detections."""
+    fields = {v['field'] for v in cell['property_violations']}
+    if 'execution.errors' in fields:
+        return 'incidental_error'
+    if cell['passed']:
+        return 'survived'
+    if intended_properties and intended_properties <= fields:
+        return 'intended_property'
+    return 'other_business_property'
+
+
+@pytest.fixture(scope='module')
+def mutation_results(tmp_path_factory):
+    from sqlalchemy import func, select
+    from sqlalchemy.orm import Session
+    from chaoshook_engine.fixtures import scenario_from_seed, get_canonical_events, sign_event
+    from chaoshook_engine.snapshot import create_cell_engine, seed_initial_state, extract_comparable_state
+    from target_app.models import Base, CreditLedger, OutboxEmail, User
+
+    folder = tmp_path_factory.mktemp('mutation-audit')
+    results = []
+    for name in (*_MUTATION_NAMES, 'valid_control'):
+        candidate = (v2_patched.process_stripe_webhook if name == 'valid_control'
+                     else _mutant_handler(name))
+        for seed in _MUTATION_SEEDS:
+            scenario = scenario_from_seed(seed, bystander=True)
+            report = run_algebraic_prover(candidate, scenario)
+            # Read aggregate and entity evidence independently of the report.
+            # This is a separate canonical replay; all 27 matrix cells above
+            # still use their own isolated real SQLite databases.
+            engine = create_cell_engine(folder / f'{name}-{seed}.db')
+            errors = []
+            audit = None
+            try:
+                Base.metadata.create_all(engine)
+                with Session(engine) as session:
+                    seed_initial_state(session, scenario)
+                    for payload in get_canonical_events(scenario):
+                        try:
+                            candidate(session, *sign_event(payload))
+                        except Exception as exc:
+                            session.rollback()
+                            errors.append(f'{type(exc).__name__}: {exc}')
+                    actual = extract_comparable_state(session, scenario)
+                    audit = {
+                        'credit_balance_total': session.scalar(select(func.sum(User.credit_balance))),
+                        'user_balances': dict(session.execute(select(User.id, User.credit_balance)).all()),
+                        'ledger_rows': actual['credit_ledger_rows'],
+                        'ledger_sum': actual['credit_ledger_sum'],
+                        'outbox_rows': session.scalar(select(func.count()).select_from(OutboxEmail)),
+                        'ledger_users': list(session.scalars(select(CreditLedger.user_id))),
+                        'violations': scenario.validate(session, actual, errors),
+                        'errors': errors,
+                    }
+            finally:
+                engine.dispose()
+            intended = _mutation_properties(name, scenario)
+            results.append({
+                'candidate': name, 'seed': seed, 'scenario': scenario,
+                'intended_properties': intended, 'report': report, 'audit': audit,
+                'classifications': [('valid_control_pass' if name == 'valid_control' and cell['passed']
+                                     else _classify_mutation_cell(cell, intended)) for cell in report['cells']],
+            })
+    return results
+
+
+@pytest.mark.parametrize('name', _MUTATION_NAMES)
+@pytest.mark.parametrize('seed', _MUTATION_SEEDS)
+def test_seeded_candidate_mutations(mutation_results, name, seed):
+    result = next(r for r in mutation_results if (r['candidate'], r['seed']) == (name, seed))
+    # Any incidental exception, unsupported scenario, other-property rejection,
+    # or survivor is a failed mutation-test expectation with full evidence.
+    assert result['classifications'] == ['intended_property'] * 27, result
+    assert result['audit']['errors'] == [], result
+    fields = {v['field'] for v in result['audit']['violations']}
+    assert result['intended_properties'] <= fields, result
+    scenario = result['scenario']
+    assert scenario.user_id != SCENARIO_SPEC.user_id and scenario.bystander
+    assert scenario.initial_credit_balance > 0
+    if name == 'wrong_user_attribution':
+        initial_users = scenario.initial_users()
+        audit = result['audit']
+        assert audit['credit_balance_total'] == sum(u['credit_balance'] for u in initial_users) + 100
+        assert (audit['ledger_rows'], audit['ledger_sum'], audit['outbox_rows']) == (1, 100, 1)
+        assert audit['user_balances'][scenario.user_id] == scenario.initial_credit_balance
+        assert audit['user_balances'][initial_users[1]['id']] == initial_users[1]['credit_balance'] + 100
+        assert audit['ledger_users'] == [initial_users[1]['id']]
+        for cell in result['report']['cells']:
+            assert all(cell['actual_state'][key] == cell_expected for key, cell_expected in (
+                ('credit_ledger_rows', 1), ('credit_ledger_sum', 100), ('outbox_emails_count', 1)))
+
+
+@pytest.mark.parametrize('seed', _MUTATION_SEEDS)
+def test_mutation_valid_control(mutation_results, seed):
+    result = next(r for r in mutation_results if (r['candidate'], r['seed']) == ('valid_control', seed))
+    assert result['report']['passed_cells'] == 27, result
+    assert result['audit']['errors'] == result['audit']['violations'] == []
+
+
+def test_mutation_classification_requires_intended_property():
+    def cell(fields, passed=False):
+        return {'passed': passed, 'property_violations': [{'field': field} for field in fields]}
+
+    intended = {'credit_ledger.identity'}
+    assert _classify_mutation_cell(cell(intended), intended) == 'intended_property'
+    assert _classify_mutation_cell(cell(intended | {'execution.errors'}), intended) == 'incidental_error'
+    assert _classify_mutation_cell(cell({'subscription.status'}), intended) == 'other_business_property'
+    assert _classify_mutation_cell(cell([], passed=True), intended) == 'survived'
+
+
+def test_mutation_summary(mutation_results, tmp_path):
+    """Use pytest -s -k mutation_summary to emit the reproducible JSON artifact."""
+    from collections import Counter
+
+    evaluations = []
+    for result in mutation_results:
+        counts = Counter(result['classifications'])
+        evaluations.append({
+            'candidate': result['candidate'], 'seed': result['seed'],
+            'import_error': None,  # Direct callable fixtures; no dynamic source imports.
+            'intended_properties': sorted(result['intended_properties']),
+            'observed_business_properties': sorted({v['field'] for cell in result['report']['cells']
+                                                    for v in cell['property_violations']
+                                                    if v['field'] != 'execution.errors'}),
+            'cell_outcomes': {key: counts[key] for key in (
+                'intended_property', 'incidental_error', 'other_business_property', 'survived',
+                'valid_control_pass')},
+            'execution_errors': sorted({error for cell in result['report']['cells']
+                                       for v in cell['property_violations'] if v['field'] == 'execution.errors'
+                                       for error in v['actual']}),
+            'canonical_replay': result['audit'],
+        })
+    mutants = [item for item in evaluations if item['candidate'] != 'valid_control']
+    valid = [item for item in mutants if not item['execution_errors'] and not item['canonical_replay']['errors']]
+    detected = {name for name in _MUTATION_NAMES if all(
+        item['cell_outcomes']['intended_property'] == 27 for item in mutants if item['candidate'] == name)}
+    summary = {
+        'schema_version': 1, 'seeds': list(_MUTATION_SEEDS), 'input_role': 'regression',
+        'coverage_per_candidate_seed': {'schedule_ids': list(range(1, 28)),
+                                        'canonical_audit_replays': 1},
+        'mutation_count': len(_MUTATION_NAMES),
+        'valid_mutation_count': sum(all(item in valid for item in mutants if item['candidate'] == name)
+                                    for name in _MUTATION_NAMES),
+        'valid_mutation_evaluations': len(valid),
+        'intended_property_detected_count': len(detected),
+        'incidental_error_evaluations': sum(bool(item['execution_errors'] or item['canonical_replay']['errors'])
+                                           for item in mutants),
+        'intended_property_detected_mutations': sorted(detected),
+        'surviving_mutations': sorted({item['candidate'] for item in mutants
+                                      if item['cell_outcomes']['survived']}),
+        'evaluations': evaluations,
+    }
+    path = tmp_path / 'mutation-summary.json'
+    path.write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    print(f'\nMutation summary: {path}')
+    assert json.loads(path.read_text(encoding='utf-8')) == summary
+    assert len(valid) == 15 and len(detected) == 5, summary
+    assert summary['surviving_mutations'] == [], summary
