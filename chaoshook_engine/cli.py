@@ -64,6 +64,8 @@ def live_patch_check() -> int:
         (HANDLER_DIR / "active_handler.py").read_text(encoding="utf-8"), report,
     )
     emit(f"Wonder {client.wonder_model}: {(perf_counter() - start) * 1000:.0f} ms")
+    for round_result in client.model_routing.get("cegis_rounds", []):
+        emit(f"CEGIS Round {round_result['round']}: {round_result['passed_cells']}/27 cells passed")
     if not client.model_routing["wonder_live"]:
         emit(f"Live patch unavailable; fallback: {client.model_routing['fallback_reason']}")
         emit("Live patch proof skipped (cached code is not a live result).")

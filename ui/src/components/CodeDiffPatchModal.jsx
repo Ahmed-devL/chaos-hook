@@ -1,6 +1,16 @@
 import { useEffect, useRef } from 'react';
 import { LoaderCircle } from 'lucide-react';
 
+function rejectionExplanation(rejection) {
+  if (rejection.import_error) return 'The candidate could not be imported.';
+  const failed = rejection.failed_cell_ids ?? [];
+  const categories = [];
+  if (failed.some((id) => id >= 1 && id <= 24)) categories.push('event ordering');
+  if (failed.includes(25)) categories.push('concurrent duplicate delivery');
+  if (failed.some((id) => id === 26 || id === 27)) categories.push('crash recovery');
+  return categories.length ? `Remaining failures: ${categories.join(', ')}.` : 'See prover evidence for details.';
+}
+
 function lineStyle(line) {
   if (line.startsWith('---') || line.startsWith('+++')) return 'text-slate-500';
   if (line.startsWith('@@')) return 'bg-brass/10 text-brass';
@@ -9,7 +19,7 @@ function lineStyle(line) {
   return 'text-slate-300';
 }
 
-export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, onApplyCached, rejection, applying }) {
+export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, onApplyCached, partialPatchCode, rejection, applying }) {
   const dialogRef = useRef(null);
 
   useEffect(() => {
@@ -33,6 +43,9 @@ export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, o
           <button type="button" onClick={onClose} className="rounded border border-slate-600 px-4 py-2 hover:bg-slate-800">Close</button>
         </header>
         <p className="mb-3 text-sm text-brass">Patch source: {analysis?.model_routing?.wonder_live ? 'LIVE Muse Wonder' : 'Verified cache'}</p>
+        {!!analysis?.model_routing?.cegis_rounds?.length && <p className="mb-3 text-sm text-slate-300">
+          {analysis.model_routing.cegis_rounds.map((round) => `Round ${round.round}: ${round.passed_cells}/27`).join(' → ')}
+        </p>}
         <div aria-label="Unified diff" tabIndex={0} className="min-h-0 flex-1 overflow-auto rounded border border-slate-800 bg-slate-950 py-3 font-mono text-xs leading-relaxed sm:text-sm">
           {(analysis?.unified_diff ?? '').split('\n').map((line, index) => (
             <div key={index} className={`min-w-max whitespace-pre px-4 ${lineStyle(line)}`}>{line || ' '}</div>
@@ -40,15 +53,22 @@ export default function CodeDiffPatchModal({ open, onClose, analysis, onApply, o
         </div>
         <footer className="mt-4">
           {rejection && <div role="alert" className="mb-3 rounded border border-crimson/50 bg-crimson/10 p-3 text-sm text-crimson">
-            <p>Patch rejected by prover: {rejection.passed_cells}/27 cells pass</p>
+            <p>Patch rejected by prover: {rejection.passed_cells}/{rejection.total_cells} cells pass</p>
             <p>Failing cells: {rejection.failed_cell_ids?.join(', ') || 'not run (import failed)'}</p>
+            <p>{rejectionExplanation(rejection)}</p>
             {rejection.import_error && <p className="mt-1 whitespace-pre-wrap break-words">{rejection.import_error}</p>}
           </div>}
+          <div className="flex flex-wrap gap-3">
           <button type="button" onClick={() => onApply(analysis.patched_code)} disabled={applying || !analysis?.patched_code}
             className="flex items-center justify-center gap-2 rounded bg-brass px-5 py-3 font-semibold text-slate-950 hover:bg-amber-500 disabled:cursor-wait disabled:opacity-60">
             {applying && <LoaderCircle aria-hidden="true" size={18} className="animate-spin" />}
             {applying ? 'Verifying Patch Before Applying…' : 'Apply Atomic Patch & Re-Prove (27/27)'}
           </button>
+          <button type="button" onClick={() => onApply(partialPatchCode)} disabled={applying || !partialPatchCode}
+            className="rounded border border-brass px-4 py-2 text-sm text-brass hover:bg-brass/10 disabled:opacity-60">
+            Test Naive Idempotency-Only Patch
+          </button>
+          </div>
           {rejection && <button type="button" onClick={onApplyCached} disabled={applying}
             className="mt-3 rounded border border-brass px-4 py-2 text-sm text-brass hover:bg-brass/10 disabled:opacity-60">
             Apply verified cached patch instead

@@ -1,6 +1,99 @@
 import { useId, useState } from 'react';
 import { LoaderCircle } from 'lucide-react';
 
+const ARCHITECTURE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="650" viewBox="0 0 1100 650">
+  <rect width="1100" height="650" fill="#020617"/>
+  <g font-family="Arial, sans-serif" fill="#e2e8f0">
+    <text x="45" y="55" font-size="28">NovaCloud Stripe webhook flow</text>
+    <text x="45" y="95" font-size="20" fill="#fbbf24">assumes in-order, exactly-once delivery</text>
+    <text x="45" y="150" font-size="19">Design arrival order: e1 → e2 → e3 → e4</text>
+    <g font-size="17" fill="#94a3b8">
+      <text x="45" y="185">e1 checkout.session.completed → e2 customer.subscription.created</text>
+      <text x="45" y="215">→ e3 invoice.paid → e4 customer.subscription.deleted</text>
+    </g>
+    <g stroke="#d97706" stroke-width="2" fill="#0f172a">
+      <rect x="45" y="335" width="155" height="65" rx="8"/>
+      <rect x="270" y="335" width="235" height="65" rx="8"/>
+      <rect x="575" y="335" width="150" height="65" rx="8"/>
+      <rect x="825" y="255" width="235" height="50" rx="6"/>
+      <rect x="825" y="320" width="235" height="50" rx="6"/>
+      <rect x="825" y="385" width="235" height="50" rx="6"/>
+      <rect x="825" y="450" width="235" height="50" rx="6"/>
+      <rect x="825" y="515" width="235" height="50" rx="6"/>
+    </g>
+    <g stroke="#d97706" stroke-width="3" fill="none">
+      <path d="M200 367 H270 M258 360 L270 367 L258 374"/>
+      <path d="M505 367 H575 M563 360 L575 367 L563 374"/>
+      <path d="M725 367 H775 V280 H825 M775 345 H825 M775 410 H825 M775 367 V540 H825 M775 475 H825"/>
+    </g>
+    <g font-size="21" text-anchor="middle">
+      <text x="122" y="375">Stripe</text><text x="387" y="375">/webhook endpoint</text>
+      <text x="650" y="375">handler</text><text x="942" y="287">users</text>
+      <text x="942" y="352">subscriptions</text><text x="942" y="417">credit_ledger</text>
+      <text x="942" y="482">webhook_events</text><text x="942" y="547">outbox_emails</text>
+    </g>
+    <text x="45" y="610" font-size="18" fill="#94a3b8">Design assumptions are hypotheses; the 27-cell SQL prover tests their consequences.</text>
+  </g>
+</svg>`;
+
+export async function builtInDiagramPng() {
+  const url = URL.createObjectURL(new Blob([ARCHITECTURE_SVG], { type: 'image/svg+xml' }));
+  try {
+    const image = new Image();
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = () => reject(new Error('Could not rasterize architecture diagram'));
+      image.src = url;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = 1100;
+    canvas.height = 650;
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Canvas is unavailable for diagram conversion');
+    context.drawImage(image, 0, 0);
+    const uri = canvas.toDataURL('image/png');
+    if (uri.length > 400_000) throw new Error('Built-in diagram exceeds 400KB');
+    return uri;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function DiagramInput({ enabled, onEnabledChange, image, onImageChange, disabled }) {
+  const [error, setError] = useState(null);
+  async function upload(event) {
+    const file = event.target.files?.[0];
+    setError(null);
+    if (!file) return;
+    if (!['image/png', 'image/jpeg'].includes(file.type) || file.size > 1_100_000) {
+      setError('Choose a PNG or JPEG under 1.1MB.');
+      event.target.value = '';
+      return;
+    }
+    try {
+      const value = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('Could not read diagram image'));
+        reader.readAsDataURL(file);
+      });
+      onImageChange(value);
+    } catch (cause) { setError(cause.message); }
+  }
+  return <div className="mb-5 space-y-3 rounded border border-slate-700 bg-slate-950 p-3">
+    <p className="text-sm font-semibold text-brass">NovaCloud Stripe webhook flow</p>
+    {image ? <img src={image} alt="Uploaded architecture diagram to send to Spark" className="max-h-64 w-full object-contain" />
+      : <div className="[&_svg]:h-auto [&_svg]:w-full" dangerouslySetInnerHTML={{ __html: ARCHITECTURE_SVG }} />}
+    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={enabled} onChange={(event) => onEnabledChange(event.target.checked)} disabled={disabled} className="accent-amber-500" />Send diagram to Spark 1.3</label>
+    <label className="block text-xs text-slate-300">Upload a PNG/JPEG instead
+      <input type="file" accept="image/png,image/jpeg" onChange={upload} disabled={disabled} className="mt-2 block w-full min-w-0 text-xs" />
+    </label>
+    {image && <button type="button" onClick={() => onImageChange(null)} disabled={disabled} className="text-xs text-brass">Use built-in diagram</button>}
+    <p className="text-xs text-slate-400">Diagram settings apply to the next Diagnose run.</p>
+    {error && <p role="alert" className="text-xs text-crimson">{error}</p>}
+  </div>;
+}
+
 function edgeKinds(cluster) {
   const kinds = [];
   if (cluster.cells.some((id) => id >= 1 && id <= 24)) kinds.push('ordering');
@@ -58,7 +151,7 @@ function LifecycleDiagram({ clusters, activeCluster }) {
   );
 }
 
-export default function MuseNeuroSymbolicPanel({ analysis, loading, onSelectCell, onOpenPatch }) {
+export default function MuseNeuroSymbolicPanel({ analysis, loading, onSelectCell, onOpenPatch, sendDiagram, onSendDiagramChange, diagramImage, onDiagramImageChange }) {
   const [activeCluster, setActiveCluster] = useState(null);
   const cached = analysis?.model_routing.used_fallback_cache;
 
@@ -71,6 +164,8 @@ export default function MuseNeuroSymbolicPanel({ analysis, loading, onSelectCell
           {cached === true ? 'VERIFIED CACHE' : cached === false ? 'LIVE MODEL' : 'SOURCE PENDING'}
         </span>
       </header>
+      {analysis && <p className="mb-3 inline-block rounded border border-slate-700 px-2 py-1 text-xs text-brass">Spark saw diagram: {analysis.model_routing.spark_live ? analysis.model_routing.spark_multimodal ? 'yes' : 'no (text-only)' : 'cached'}</p>}
+      <DiagramInput enabled={sendDiagram} onEnabledChange={onSendDiagramChange} image={diagramImage} onImageChange={onDiagramImageChange} disabled={loading} />
       {loading ? (
         <p role="status" className="flex items-center gap-2 text-brass"><LoaderCircle aria-hidden="true" size={18} className="animate-spin" />Diagnosing failures and synthesizing an atomic patch…</p>
       ) : !analysis ? (
@@ -81,6 +176,7 @@ export default function MuseNeuroSymbolicPanel({ analysis, loading, onSelectCell
             <section aria-labelledby="spark-heading" className="min-w-0">
               <h2 id="spark-heading" className="mb-3 text-lg font-semibold">Muse Spark 1.3 Diagnosis</h2>
               <p className="text-slate-300">{analysis.diagnosis.summary_headline}</p>
+              {analysis.diagnosis.diagram_findings?.length > 0 && <ul className="my-3 list-disc space-y-2 pl-5 text-sm text-brass">{analysis.diagnosis.diagram_findings.map((finding, index) => <li key={index}>{finding}</li>)}</ul>}
               <LifecycleDiagram clusters={analysis.diagnosis.failure_clusters} activeCluster={activeCluster} />
               <div className="space-y-3">
                 {analysis.diagnosis.failure_clusters.map((cluster, index) => (

@@ -16,6 +16,6 @@ async function request(path, method = 'GET', body) {
 
 export const getStatus = () => request('status');
 export const prove = () => request('prove', 'POST');
-export const diagnose = (body = {}) => request('diagnose', 'POST', body);
+export const diagnose = ({ diagram_image = null, ...body } = {}) => request('diagnose', 'POST', { ...body, diagram_image });
 export const patch = (body) => request('patch', 'POST', body);
 export const reset = () => request('reset', 'POST');

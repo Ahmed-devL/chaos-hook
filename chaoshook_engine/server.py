@@ -1,5 +1,7 @@
 """Local JSON API for the deterministic prover and Muse analysis."""
 
+import base64
+import binascii
 import importlib
 from threading import RLock
 from time import perf_counter
@@ -10,7 +12,7 @@ from pydantic import BaseModel
 
 from chaoshook_engine.muse_client import MuseNeuroSymbolicClient, SPARK, WONDER
 from chaoshook_engine.patcher import (
-    apply_patch_to_active, get_active_handler_status, reset_active_to_vulnerable,
+    HANDLER_DIR, apply_patch_to_active, get_active_handler_status, reset_active_to_vulnerable,
     verify_candidate_patch,
 )
 from chaoshook_engine.runner import run_algebraic_prover
@@ -19,7 +21,7 @@ from target_app.handlers import active_handler
 
 app = FastAPI(title="The Brass Escapement — ChaosHook", version="0.1.0")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"],
 )
 
 # Synchronous endpoints run in FastAPI's worker pool. Keep module reloads and
@@ -36,6 +38,7 @@ app.state.model_routing = {
 
 
 class DiagnoseRequest(BaseModel):
+    diagram_image: str | None = None
     diagram_description: str | None = None
     use_cache: bool = False
 
@@ -75,6 +78,7 @@ def status() -> dict:
         report = _prove(handler_status)
         return {
             **handler_status, "handler_status": handler_status,
+            "partial_patch_code": (HANDLER_DIR / "v1_partial_idempotent.py").read_text(encoding="utf-8"),
             "model_routing": dict(app.state.model_routing), "prover_report": report,
         }
 
@@ -87,6 +91,17 @@ def prove() -> dict:
 
 @app.post("/api/diagnose")
 def diagnose(body: DiagnoseRequest | None = None) -> dict:
+    if body and body.diagram_image is not None:
+        image = body.diagram_image
+        if not image.startswith(("data:image/png;base64,", "data:image/jpeg;base64,")):
+            raise HTTPException(400, "diagram_image must be a PNG or JPEG base64 data URI")
+        if len(image) > 1_500_000:
+            raise HTTPException(400, "diagram_image exceeds 1.5MB")
+        try:
+            if not base64.b64decode(image.split(",", 1)[1], validate=True):
+                raise ValueError("empty image")
+        except (ValueError, binascii.Error):
+            raise HTTPException(400, "diagram_image contains invalid base64") from None
     with _lock:
         started = perf_counter()
         report = _prove(get_active_handler_status())
@@ -95,6 +110,7 @@ def diagnose(body: DiagnoseRequest | None = None) -> dict:
             client.force_cache = True
         analysis = client.run_full_neuro_symbolic_analysis(
             report, diagram_description=body.diagram_description if body else None,
+            diagram_image=body.diagram_image if body else None,
         )
         analysis["model_routing"]["elapsed_ms"] = round((perf_counter() - started) * 1000, 3)
         app.state.analysis = analysis

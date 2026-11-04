@@ -3,7 +3,7 @@ import { Code2, Gauge, LoaderCircle, Play, RotateCcw, Sparkles } from 'lucide-re
 import { getStatus, prove, diagnose, patch, reset } from './api.js';
 import ProofMatrixGrid from './components/ProofMatrixGrid.jsx';
 import StateDiffInspector from './components/StateDiffInspector.jsx';
-import MuseNeuroSymbolicPanel from './components/MuseNeuroSymbolicPanel.jsx';
+import MuseNeuroSymbolicPanel, { builtInDiagramPng } from './components/MuseNeuroSymbolicPanel.jsx';
 import CodeDiffPatchModal from './components/CodeDiffPatchModal.jsx';
 
 function defaultCell(cells) {
@@ -26,6 +26,8 @@ export default function App() {
   const [analysis, setAnalysis] = useState(null);
   const [patchOpen, setPatchOpen] = useState(false);
   const [patchRejection, setPatchRejection] = useState(null);
+  const [sendDiagram, setSendDiagram] = useState(true);
+  const [diagramImage, setDiagramImage] = useState(null);
   const [instantMode, setInstantMode] = useState(false);
   const [diagnosisSeconds, setDiagnosisSeconds] = useState(0);
   const [pending, setPending] = useState('load');
@@ -100,7 +102,10 @@ export default function App() {
   function runDiagnosis() {
     setInspectorTab('muse');
     setPatchRejection(null);
-    return request('diagnose', async () => { setAnalysis(await diagnose({ use_cache: instantMode })); });
+    return request('diagnose', async () => {
+      const image = sendDiagram ? diagramImage ?? await builtInDiagramPng() : null;
+      setAnalysis(await diagnose({ use_cache: instantMode, diagram_image: image }));
+    });
   }
 
   function applyPatch(patchedCode) {
@@ -211,12 +216,12 @@ export default function App() {
             <StateDiffInspector cell={report?.cells.find((cell) => cell.id === selectedId)} goldenState={report?.golden_state} />
           ) : (
             <div className="[&_.grid]:grid-cols-1 [&_section.mt-6]:mt-0">
-              <MuseNeuroSymbolicPanel analysis={analysis} loading={pending === 'diagnose'} onSelectCell={(id) => { setSelectedId(id); setInspectorTab('state'); }} onOpenPatch={() => { if (!busy) setPatchOpen(true); }} />
+              <MuseNeuroSymbolicPanel sendDiagram={sendDiagram} onSendDiagramChange={setSendDiagram} diagramImage={diagramImage} onDiagramImageChange={setDiagramImage} analysis={analysis} loading={pending === 'diagnose'} onSelectCell={(id) => { setSelectedId(id); setInspectorTab('state'); }} onOpenPatch={() => { if (!busy) setPatchOpen(true); }} />
             </div>
           )}
         </aside>
       </div>
-      <CodeDiffPatchModal open={patchOpen} onClose={() => setPatchOpen(false)} analysis={analysis} onApply={applyPatch} onApplyCached={() => applyPatchRequest()} rejection={patchRejection} applying={pending === 'patch'} />
+      <CodeDiffPatchModal open={patchOpen} onClose={() => setPatchOpen(false)} analysis={analysis} onApply={applyPatch} partialPatchCode={status?.partial_patch_code} onApplyCached={() => applyPatchRequest()} rejection={patchRejection} applying={pending === 'patch'} />
     </main>
   );
 }

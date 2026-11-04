@@ -1,5 +1,6 @@
 """Muse model routing with a deterministic, locally verified demo cache."""
 
+from copy import deepcopy
 from itertools import permutations
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -13,10 +14,52 @@ from time import perf_counter
 
 import httpx
 
-from chaoshook_engine.patcher import HANDLER_DIR, compute_unified_diff
+from chaoshook_engine.patcher import HANDLER_DIR, compute_unified_diff, verify_candidate_patch
 
 
 logger = logging.getLogger(__name__)
+
+
+def counterexample_view(report: dict, max_chars: int = 30000) -> dict:
+    """Select distinct failures and bounded race/crash evidence without mutating report.
+
+    If mandatory evidence alone exceeds the budget, fail explicitly rather than
+    silently removing a distinct failure or returning an oversized payload.
+    """
+    failures = [cell for cell in report.get("cells", []) if cell.get("passed") is False]
+    counterexamples = []
+    seen = set()
+    for cell in failures:
+        reason = cell["failure_reason"]
+        fault = cell["category"] in {"concurrency", "crash_retry"}
+        if reason not in seen or fault:
+            example = {key: deepcopy(cell[key]) for key in
+                       ("id", "category", "label", "sequence", "failure_reason", "state_diff")}
+            if fault:
+                example["sql_trace"] = deepcopy(cell["sql_trace"][:12])
+            counterexamples.append(example)
+        seen.add(reason)
+    result = {
+        "golden_state": deepcopy(report.get("golden_state", {})),
+        "summary": {"passed_cells": int(report.get("passed_cells", 0)),
+                    "total_cells": 27, "failed_cell_ids": [cell["id"] for cell in failures]},
+        "counterexamples": counterexamples,
+    }
+    if len(json.dumps(result)) > max_chars:
+        for example in counterexamples:
+            example.pop("sql_trace", None)
+        # A permutation representative can also be covered by a mandatory fault cell.
+        for example in list(reversed(counterexamples)):
+            if len(json.dumps(result)) <= max_chars:
+                break
+            if example["category"] == "permutation" and any(
+                other is not example and other["failure_reason"] == example["failure_reason"]
+                for other in counterexamples
+            ):
+                counterexamples.remove(example)
+    if len(json.dumps(result)) > max_chars:
+        raise ValueError("counterexample budget is too small for mandatory failure evidence")
+    return result
 
 
 def _load_env():
@@ -61,8 +104,22 @@ order commutativity and crash atomicity. Use a single transaction, claim-first
 INSERT INTO webhook_events ... ON CONFLICT(event_id) DO NOTHING with rowcount == 0,
 tombstone upserts, monotonic last_event_ts, and no intermediate commits.
 Return a complete importable Python module defining
-process_stripe_webhook(session, raw_body, sig_header). The supplied
-verified_reference_code illustrates the schema and handler contract."""
+process_stripe_webhook(session, raw_body, sig_header) -> dict.
+The handler_contract is an interface description:
+Allowed imports:
+from sqlalchemy import text
+from target_app.hmac_auth import verify_stripe_signature
+from target_app.models import CreditLedger, Subscription, User, WebhookEvent, OutboxEmail
+from target_app.schemas import StripeEvent
+from target_app.side_effects import send_welcome_email
+Model columns:
+User: id, email, stripe_customer_id, plan_tier, credit_balance, welcome_email_sent, last_event_ts
+Subscription: id, user_id, stripe_customer_id, status, current_period_end, last_event_ts
+CreditLedger: id, user_id, invoice_id, delta, reason
+WebhookEvent: event_id, event_type, created_ts, status
+OutboxEmail: id, user_id, template, dedupe_key
+Golden-state expectations: credit_balance 100, one welcome email, final subscription
+status and user plan_tier canceled."""
 SPARK_PROMPT = """You are Meta Muse Spark 1.3, a Multimodal Distributed State & Payment
 Flow Auditor. Given a webhook lifecycle report and optional diagram description,
 return strict JSON with summary_headline, failure_clusters (three objects with
@@ -71,7 +128,10 @@ Breakdown (18/24 permutations in the vulnerable baseline), Parallel TOCTOU Race
 (Cell #25), and Mid-Handler Crash Atomicity (Cells #26-27). Explain tombstone drops,
 stale overwrites, SELECT-before-INSERT races and intermediate-commit retry
 amplification. Distinguish observed failures from baseline expectations. Explain
-how atomic claims, transactional outbox and timestamp watermarks restore 27/27."""
+how atomic claims, transactional outbox and timestamp watermarks restore 27/27.
+When a diagram image is provided, optionally add diagram_findings: a list of up to
+3 short strings, each naming a diagram element or assumption and the failing
+cells that contradict it. Omit findings unsupported by the image or report."""
 
 
 class MuseNeuroSymbolicClient:
@@ -82,17 +142,18 @@ class MuseNeuroSymbolicClient:
         self.wonder_model = os.getenv("MUSE_WONDER_MODEL", WONDER).strip() or WONDER
         self.spark_model = os.getenv("MUSE_SPARK_MODEL", SPARK).strip() or SPARK
         try:
-            self.timeout = float(os.getenv("MUSE_TIMEOUT_S", "90"))
+            self.timeout = float(os.getenv("MUSE_TIMEOUT_S", "180"))
             if not math.isfinite(self.timeout) or self.timeout <= 0:
                 raise ValueError("invalid timeout")
         except ValueError:
-            self.timeout = 90.0
+            self.timeout = 180.0
         self.force_cache = os.getenv("DEMO_FALLBACK_CACHE", "false").strip().lower() in {
             "true", "1", "yes", "on",
         }
         self.used_fallback_cache = False
-        self.model_routing = {"wonder_live": False, "spark_live": False,
-                              "fallback_reason": None}
+        self.model_routing = {"spark_multimodal": False, "image_bytes": 0, "spark_errors": [],
+                              "wonder_live": False, "spark_live": False,
+                              "fallback_reason": None, "payload_chars": {"wonder": [], "spark": []}}
         self._fallback_reasons = {}
         self._routing_lock = Lock()
 
@@ -110,8 +171,9 @@ class MuseNeuroSymbolicClient:
 
     def safe_error(self, value):
         """Redact credentials even when an upstream error echoes its input."""
-        result = str(value)
-        for secret in (self.api_key, os.getenv("MUSE_API_KEY"), os.getenv("MODEL_API_KEY")):
+        result = re.sub(r"data:image/[^,\s]+,[A-Za-z0-9+/=]+", "[IMAGE REDACTED]", str(value))
+        for secret in (self.api_key, os.getenv("MUSE_API_KEY"), os.getenv("MODEL_API_KEY"),
+                       self.base_url, os.getenv("MUSE_BASE_URL"), os.getenv("META_BASE_URL")):
             if secret:
                 result = result.replace(secret, "[REDACTED]")
         return result
@@ -128,7 +190,7 @@ class MuseNeuroSymbolicClient:
             raise ValueError(self.safe_error(f"HTTP {response.status_code}: {response.text}"))
         return response.json()
 
-    def _request(self, part, model, prompt, payload, fallback, validate):
+    def _request(self, part, model, prompt, payload, fallback, validate, request_timeout=None, diagram_image=None):
         try:
             key = self.api_key.lower()
             if (self.force_cache or not key or not self.base_url
@@ -137,21 +199,71 @@ class MuseNeuroSymbolicClient:
                         "your_", "your-", "replace", "example", "placeholder", "<", ">",
                     ))):
                 raise ValueError("offline mode or missing/placeholder Muse configuration")
-            response = self.api_request(
-                "POST", "chat/completions",
-                json={"model": model, "temperature": 0,
-                      "response_format": {"type": "json_object"},
-                      "messages": [{"role": "system", "content": prompt},
-                                   {"role": "user", "content": json.dumps(payload)}]},
-            )
-            content = response["choices"][0]["message"]["content"].strip()
-            if content.startswith("```"):
-                content = re.sub(r"^```(?:json)?\s*\n?", "", content, count=1,
-                                 flags=re.IGNORECASE)
-                content = re.sub(r"\s*```$", "", content)
-            result = json.loads(content)
-            if not validate(result):
-                raise ValueError("model response violates the structured output contract")
+            # Compact only after the live configuration gate. Cache responses retain
+            # the original report, and budget errors use the normal safe fallback.
+            report = payload["prover_report"]
+            view = counterexample_view(report)
+            if "import_error" in report:
+                view["import_error"] = report["import_error"]
+            payload = {**payload, "prover_report": json.loads(
+                self.safe_error(json.dumps(view)))}
+            body = {"model": model, "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                    "messages": [{"role": "system", "content": prompt},
+                                 {"role": "user", "content": json.dumps(payload)}]}
+            with self._routing_lock:
+                self.model_routing["payload_chars"][part].append(len(json.dumps(body)))
+            options = {"timeout": request_timeout} if request_timeout is not None else {}
+
+            def attempt(image, response_format=True):
+                request_body = deepcopy(body)
+                if image:
+                    request_body["messages"][1]["content"] = [
+                        {"type": "text", "text": json.dumps(payload)},
+                        {"type": "image_url", "image_url": {"url": image}},
+                    ]
+                if not response_format:
+                    request_body.pop("response_format", None)
+                response = self.api_request("POST", "chat/completions", json=request_body, **options)
+                content = response["choices"][0]["message"]["content"].strip()
+                if content.startswith("```"):
+                    content = re.sub(r"^```(?:json)?\s*\n?", "", content, count=1,
+                                     flags=re.IGNORECASE)
+                    content = re.sub(r"\s*```$", "", content)
+                result = json.loads(content)
+                if not validate(result):
+                    raise ValueError("model response violates the structured output contract")
+                return result
+
+            def record_error(exc):
+                # JSON errors can retain the entire response document. Record only
+                # their type; sanitize every other error before retaining it.
+                reason = type(exc).__name__ if isinstance(exc, json.JSONDecodeError) else self.safe_error(exc)
+                self.model_routing["spark_errors"].append(reason)
+
+            if diagram_image:
+                try:
+                    result = attempt(diagram_image)
+                    self.model_routing["spark_multimodal"] = True
+                except Exception as first:
+                    record_error(first)
+                    status = getattr(getattr(first, "response", None), "status_code", None)
+                    is_4xx = (status is not None and 400 <= status < 500) or re.search(r"\bHTTP 4\d\d\b", str(first))
+                    try:
+                        if not is_4xx:
+                            raise first
+                        result = attempt(diagram_image, response_format=False)
+                        self.model_routing["spark_multimodal"] = True
+                    except Exception as second:
+                        if second is not first:
+                            record_error(second)
+                        try:
+                            result = attempt(None)
+                        except Exception as last:
+                            record_error(last)
+                            raise
+            else:
+                result = attempt(None)
             self._record_route(part, True)
             return result
         except Exception as exc:
@@ -206,13 +318,60 @@ class MuseNeuroSymbolicClient:
                                     for c in i["violated_by_cells"])
                             for i in value["invariants"]))
 
-        return self._request("wonder", self.wonder_model, WONDER_PROMPT,
-                             {"schema_code": schema_code, "handler_code": handler_code,
-                              "prover_report": prover_report, "verified_reference_code": reference},
-                             fallback, valid)
+        payload = {"schema_code": schema_code, "handler_code": handler_code,
+                   "prover_report": prover_report,
+                   "handler_contract": "process_stripe_webhook(session, raw_body, sig_header) -> dict\n" + WONDER_PROMPT.split(
+                       "The handler_contract is an interface description:", 1)[1].strip()}
+        self.model_routing["cegis_rounds"] = []
+        max_rounds = 2
+        started = perf_counter()
+        time_budget = 240.0
+        for round_number in range(1, max_rounds + 1):
+            elapsed = perf_counter() - started
+            if round_number > 1 and elapsed * 2 > time_budget:
+                self._record_route("wonder", False,
+                                   "CEGIS round 2 skipped: projected runtime exceeds "
+                                   "240-second total time budget; using verified cache")
+                return fallback
+            prompt = WONDER_PROMPT
+            if round_number > 1:
+                prompt += ("\nRepair your own previous patch in handler_code using the "
+                           "remaining counterexamples and import_error in prover_report. "
+                           "Return the same strict JSON contract.")
+            candidate = self._request("wonder", self.wonder_model, prompt,
+                                      payload, fallback, valid,
+                                      request_timeout=min(self.timeout, time_budget - elapsed))
+            # _request handles forced cache, unusable keys and network failures.
+            if not self.model_routing["wonder_live"]:
+                return fallback
+            try:
+                verification = verify_candidate_patch(candidate["patched_code"])
+            except Exception as exc:
+                self._record_route("wonder", False,
+                                   "candidate verification failed: " + self.safe_error(exc))
+                return fallback
+            import_error = (self.safe_error(verification["import_error"])
+                            if verification["import_error"] else None)
+            self.model_routing["cegis_rounds"].append({
+                "round": round_number, "passed_cells": verification["passed_cells"],
+                "failed_cell_ids": verification["failed_cell_ids"],
+                "verified": verification["verified"], "import_error": import_error,
+                "payload_chars": self.model_routing["payload_chars"]["wonder"][-1],
+            })
+            if verification["verified"]:
+                return candidate
+            payload["handler_code"] = candidate["patched_code"]
+            payload["prover_report"] = {
+                **(verification["prover_report"] or {}), "import_error": import_error,
+            }
+        self._record_route("wonder", False,
+                           f"CEGIS exhausted {max_rounds} rounds without a verified patch; "
+                           "using verified cache")
+        return fallback
 
     def diagnose_multimodal_divergence(self, prover_report: dict,
-                                      diagram_description: str | None = None) -> dict:
+                                      diagram_description: str | None = None,
+                                      diagram_image: str | None = None) -> dict:
         fallback = {
             "summary_headline": "The vulnerable baseline loses cancellation ordering and amplifies side effects under races and crash retries.",
             "failure_clusters": [
@@ -231,6 +390,9 @@ class MuseNeuroSymbolicClient:
             return (isinstance(value, dict)
                     and all(isinstance(value.get(k), str) and value[k]
                             for k in ("summary_headline", "remediation_proof_plan"))
+                    and ("diagram_findings" not in value or (isinstance(value["diagram_findings"], list)
+                         and len(value["diagram_findings"]) <= 3
+                         and all(isinstance(f, str) for f in value["diagram_findings"])))
                     and isinstance(value.get("failure_clusters"), list)
                     and len(value["failure_clusters"]) == 3
                     and all(isinstance(c, dict)
@@ -241,28 +403,35 @@ class MuseNeuroSymbolicClient:
                                     for cell in c["cells"])
                             for c in value["failure_clusters"]))
 
+        self.model_routing["spark_multimodal"] = False
+        encoded_image = diagram_image.split(",", 1)[-1] if diagram_image else ""
+        self.model_routing["image_bytes"] = len(encoded_image.rstrip("=")) * 3 // 4
         return self._request("spark", self.spark_model, SPARK_PROMPT,
                              {"prover_report": prover_report,
-                              "diagram_description": diagram_description}, fallback, valid)
+                              "diagram_description": diagram_description}, fallback, valid,
+                             diagram_image=diagram_image)
 
     def run_full_neuro_symbolic_analysis(self, prover_report: dict,
-                                        diagram_description: str | None = None) -> dict:
+                                        diagram_description: str | None = None,
+                                        diagram_image: str | None = None) -> dict:
         started = perf_counter()
         self.used_fallback_cache = False
         self._fallback_reasons.clear()
-        self.model_routing.update(wonder_live=False, spark_live=False, fallback_reason=None)
+        self.model_routing.update(wonder_live=False, spark_live=False, fallback_reason=None,
+                                  payload_chars={"wonder": [], "spark": []},
+                                  spark_multimodal=False, image_bytes=0, spark_errors=[])
         schema = (HANDLER_DIR.parent / "models.py").read_text(encoding="utf-8")
         handler = (HANDLER_DIR / "active_handler.py").read_text(encoding="utf-8")
         if self.force_cache:
             wonder = self.extract_invariants_and_patch(schema, handler, prover_report)
-            diagnosis = self.diagnose_multimodal_divergence(prover_report, diagram_description)
+            diagnosis = self.diagnose_multimodal_divergence(prover_report, diagram_description, diagram_image)
         else:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="Muse") as pool:
                 wonder_future = pool.submit(
                     self.extract_invariants_and_patch, schema, handler, prover_report,
                 )
                 spark_future = pool.submit(
-                    self.diagnose_multimodal_divergence, prover_report, diagram_description,
+                    self.diagnose_multimodal_divergence, prover_report, diagram_description, diagram_image,
                 )
                 wonder, diagnosis = wonder_future.result(), spark_future.result()
         self.model_routing["elapsed_ms"] = round((perf_counter() - started) * 1000, 3)

@@ -106,7 +106,7 @@ def test_muse_aliases_and_defaults(monkeypatch):
     client = MuseNeuroSymbolicClient()
     assert client.api_key == "unit-secret"
     assert client.base_url == "https://example.invalid/v1"
-    assert client.timeout == 90
+    assert client.timeout == 180
     monkeypatch.setenv("MUSE_API_KEY", "primary-secret")
     monkeypatch.setenv("MUSE_BASE_URL", "https://primary.invalid/v1")
     monkeypatch.setenv("MUSE_TIMEOUT_S", "25")
@@ -127,7 +127,7 @@ def test_muse_fenced_live_patch_and_partial_fallback(monkeypatch):
     client = MuseNeuroSymbolicClient()
     calls = []
     simultaneous_calls = Barrier(2)
-    code = "def process_stripe_webhook(session, raw_body, sig_header):\n    return {}\n"
+    code = (Path(v2_patched.__file__)).read_text(encoding="utf-8")
 
     def request(method, path, **kwargs):
         payload = kwargs["json"]
@@ -143,6 +143,9 @@ def test_muse_fenced_live_patch_and_partial_fallback(monkeypatch):
     assert sorted(calls) == ["spark-live", "wonder-live"]
     assert result["patched_code"] == code
     routing = result["model_routing"]
+    assert routing["cegis_rounds"] == [{"round": 1, "passed_cells": 27,
+                                       "failed_cell_ids": [], "verified": True, "import_error": None,
+                                       "payload_chars": routing["payload_chars"]["wonder"][0]}]
     assert routing["wonder_live"] is True
     assert routing["spark_live"] is False
     assert routing["used_fallback_cache"] is True
@@ -204,7 +207,8 @@ def test_live_patch_check_is_temporary_and_read_only(monkeypatch, capsys, broken
 
     class FakeMuse:
         wonder_model = "unit-wonder"
-        model_routing = {"wonder_live": True}
+        model_routing = {"wonder_live": True, "cegis_rounds": [
+            {"round": 1, "passed_cells": 0 if broken_import else 27}]}
 
         def safe_error(self, value):
             return str(value)
@@ -226,6 +230,7 @@ def test_live_patch_check_is_temporary_and_read_only(monkeypatch, capsys, broken
     assert active.read_bytes() == original
     assert paths and not paths[0].exists()
     output = capsys.readouterr().out
+    assert f"CEGIS Round 1: {0 if broken_import else 27}/27 cells passed" in output
     assert ("intentional import failure" if broken_import else "27/27 cells passed") in output
 
 
@@ -292,3 +297,319 @@ def test_diagnose_instant_mode_never_calls_live_models(monkeypatch):
     assert routing["elapsed_ms"] >= 0
     assert len(analysis["invariants"]) == 4
     assert len(analysis["diagnosis"]["failure_clusters"]) == 3
+
+
+@pytest.fixture
+def partial_code():
+    from chaoshook_engine.patcher import HANDLER_DIR
+
+    return (HANDLER_DIR / "v1_partial_idempotent.py").read_text(encoding="utf-8")
+
+
+def _fake_wonder(monkeypatch, sources):
+    from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
+
+    monkeypatch.setenv("MUSE_API_KEY", "cegis-secret")
+    monkeypatch.setenv("MUSE_BASE_URL", "https://private.invalid/v1")
+    monkeypatch.setenv("DEMO_FALLBACK_CACHE", "false")
+    client = MuseNeuroSymbolicClient()
+    calls = []
+    responses = iter(sources)
+
+    def request(method, path, **kwargs):
+        calls.append(kwargs["json"])
+        return {"choices": [{"message": {"content": json.dumps({
+            "invariants": client._invariants({}), "patched_code": next(responses),
+        })}}]}
+
+    monkeypatch.setattr(client, "api_request", request)
+    return client, calls
+
+
+def _extract_patch(client, report):
+    from chaoshook_engine.patcher import HANDLER_DIR
+
+    return client.extract_invariants_and_patch(
+        (HANDLER_DIR.parent / "models.py").read_text(encoding="utf-8"),
+        (HANDLER_DIR / "v1_vulnerable.py").read_text(encoding="utf-8"), report,
+    )
+
+
+def test_live_wonder_is_reference_free_and_repairs_counterexamples(monkeypatch, reports, partial_code):
+    reference = Path(v2_patched.__file__).read_text(encoding="utf-8")
+    client, calls = _fake_wonder(monkeypatch, [partial_code, reference])
+    result = _extract_patch(client, reports["vulnerable"])
+    assert result["patched_code"] == reference
+    rounds = client.model_routing["cegis_rounds"]
+    assert len(rounds) == len(calls) == 2
+    assert rounds[0]["verified"] is False
+    assert 6 < rounds[0]["passed_cells"] < 27
+    assert rounds[1] == {"round": 2, "passed_cells": 27, "failed_cell_ids": [],
+                         "verified": True, "import_error": None,
+                         "payload_chars": len(json.dumps(calls[1]))}
+    assert client.model_routing["wonder_live"] is True
+    assert client.model_routing["fallback_reason"] is None
+    for call in calls:
+        assert "verified_reference_code" not in json.dumps(call)
+        assert reference not in call["messages"][0]["content"]
+        payload = json.loads(call["messages"][1]["content"])
+        assert set(payload) == {"schema_code", "handler_code", "prover_report", "handler_contract"}
+        assert reference not in payload.values()
+        assert len(json.dumps(call)) < 40000
+        for cell in payload["prover_report"]["counterexamples"]:
+            fields = {"id", "category", "label", "sequence", "failure_reason", "state_diff"}
+            if cell["category"] in {"concurrency", "crash_retry"}:
+                fields.add("sql_trace")
+            assert set(cell) == fields
+    feedback = json.loads(calls[1]["messages"][1]["content"])
+    assert feedback["handler_code"] == partial_code
+    assert feedback["prover_report"]["summary"]["failed_cell_ids"] == rounds[0]["failed_cell_ids"]
+
+
+def test_live_wonder_unverified_rounds_fall_back(monkeypatch, reports, partial_code):
+    client, calls = _fake_wonder(monkeypatch, [partial_code, partial_code])
+    result = _extract_patch(client, reports["vulnerable"])
+    assert result["patched_code"] == Path(v2_patched.__file__).read_text(encoding="utf-8")
+    assert len(calls) == len(client.model_routing["cegis_rounds"]) == 2
+    assert not any(r["verified"] for r in client.model_routing["cegis_rounds"])
+    assert client.model_routing["wonder_live"] is False
+    assert client.used_fallback_cache is True
+    assert "CEGIS exhausted 2 rounds" in client.model_routing["fallback_reason"]
+
+
+def test_cegis_import_feedback_redacts_key_and_base_url(monkeypatch, reports):
+    broken = ("def process_stripe_webhook(session, raw_body, sig_header): pass\n"
+              "raise ImportError('cegis-secret https://private.invalid/v1')\n")
+    reference = Path(v2_patched.__file__).read_text(encoding="utf-8")
+    client, calls = _fake_wonder(monkeypatch, [broken, reference])
+    _extract_patch(client, reports["vulnerable"])
+    error = client.model_routing["cegis_rounds"][0]["import_error"]
+    feedback = json.loads(calls[1]["messages"][1]["content"])["prover_report"]
+    assert feedback["import_error"] == error
+    assert "cegis-secret" not in error and "private.invalid" not in error
+    assert "[REDACTED]" in error
+    assert client.model_routing["cegis_rounds"][1]["verified"] is True
+
+
+def test_partial_handler_proves_atomicity_but_fails_ordering(partial_code):
+    from chaoshook_engine.patcher import verify_candidate_patch
+
+    result = verify_candidate_patch(partial_code)
+    assert result["import_error"] is None
+    assert result["verified"] is False
+    assert 6 < result["passed_cells"] < 27
+    cells = result["prover_report"]["cells"]
+    assert all(cell["passed"] for cell in cells[24:])
+    assert any(not cell["passed"] for cell in cells[:24])
+
+
+def test_partial_patch_status_and_api_rejection_leave_active_unchanged(partial_code):
+    from fastapi.testclient import TestClient
+    from chaoshook_engine import server
+    from chaoshook_engine.patcher import HANDLER_DIR
+
+    active = HANDLER_DIR / "active_handler.py"
+    original = active.read_bytes()
+    client = TestClient(server.app)
+    assert client.get("/api/status").json()["partial_patch_code"] == partial_code
+    response = client.post("/api/patch", json={"patched_code": partial_code})
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == "rejected"
+    assert result["verified"] is False
+    assert 6 < result["passed_cells"] < 27
+    assert result["failed_cell_ids"]
+    assert all(1 <= cell_id <= 24 for cell_id in result["failed_cell_ids"])
+    assert active.read_bytes() == original
+
+
+def test_counterexample_view_preserves_distinct_failures_and_fault_evidence(reports):
+    from chaoshook_engine.muse_client import counterexample_view
+
+    report = reports["vulnerable"]
+    before = json.dumps(report)
+    view = counterexample_view(report)
+    assert len(json.dumps(view)) < 30000
+    assert view["golden_state"] == report["golden_state"]
+    assert view["summary"] == {"passed_cells": 6, "total_cells": 27,
+                               "failed_cell_ids": [c["id"] for c in report["cells"] if not c["passed"]]}
+    examples = view["counterexamples"]
+    assert {c["failure_reason"] for c in examples} == {
+        c["failure_reason"] for c in report["cells"] if not c["passed"]}
+    by_id = {cell["id"]: cell for cell in report["cells"]}
+    for cell in examples:
+        assert not by_id[cell["id"]]["passed"]
+        assert "actual_state" not in cell
+        if cell["category"] == "permutation":
+            assert "sql_trace" not in cell
+        else:
+            assert cell["sql_trace"] == by_id[cell["id"]]["sql_trace"][:12]
+    assert {c["id"] for c in examples if "sql_trace" in c} == {25, 26, 27}
+    permutation_reasons = [c["failure_reason"] for c in examples if c["category"] == "permutation"]
+    assert len(permutation_reasons) == len(set(permutation_reasons))
+    assert json.dumps(report) == before
+    # Force trace removal without losing a single distinct failure reason.
+    without_traces = json.loads(json.dumps(view))
+    for cell in without_traces["counterexamples"]:
+        cell.pop("sql_trace", None)
+    compact = counterexample_view(report, max_chars=len(json.dumps(without_traces)))
+    assert not any("sql_trace" in cell for cell in compact["counterexamples"])
+    assert len(json.dumps(compact)) <= len(json.dumps(without_traces))
+    assert json.dumps(report) == before
+
+
+def test_spark_uses_compact_payload_and_records_full_request_size(monkeypatch, reports):
+    from chaoshook_engine.muse_client import counterexample_view
+
+    client, _ = _fake_wonder(monkeypatch, [])
+    calls = []
+
+    def request(method, path, **kwargs):
+        calls.append(kwargs["json"])
+        # An invalid response still records the size of the attempted live call.
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+    monkeypatch.setattr(client, "api_request", request)
+    client.diagnose_multimodal_divergence(reports["vulnerable"])
+    payload = json.loads(calls[0]["messages"][1]["content"])
+    assert payload["prover_report"] == counterexample_view(reports["vulnerable"])
+    assert len(json.dumps(calls[0])) < 40000
+    assert client.model_routing["payload_chars"]["spark"] == [len(json.dumps(calls[0]))]
+
+
+def test_cegis_skips_second_round_when_projected_runtime_exceeds_budget(monkeypatch, reports, partial_code):
+    from chaoshook_engine import muse_client
+
+    client, calls = _fake_wonder(monkeypatch, [partial_code])
+    clock = [0.0]
+    monkeypatch.setattr(muse_client, "perf_counter", lambda: clock[0])
+    request = client.api_request
+
+    def slow_request(*args, **kwargs):
+        assert kwargs["timeout"] == 180
+        response = request(*args, **kwargs)
+        clock[0] = 125.0
+        return response
+
+    monkeypatch.setattr(client, "api_request", slow_request)
+    result = _extract_patch(client, reports["vulnerable"])
+    assert result["patched_code"] == Path(v2_patched.__file__).read_text(encoding="utf-8")
+    assert len(calls) == len(client.model_routing["cegis_rounds"]) == 1
+    assert client.model_routing["wonder_live"] is False
+    assert "round 2 skipped" in client.model_routing["fallback_reason"]
+    assert "240-second total time budget" in client.model_routing["fallback_reason"]
+    assert client.model_routing["cegis_rounds"][0]["payload_chars"] == len(json.dumps(calls[0]))
+
+
+@pytest.mark.parametrize('failures, expected_multimodal', [
+    ([], True), ([400], True), ([400, 503], False), ([503], False),
+    ([400, 503, 503], False),
+])
+def test_spark_image_retry_chain(monkeypatch, failures, expected_multimodal):
+    from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
+
+    monkeypatch.setenv('MUSE_API_KEY', 'image-unit-secret')
+    monkeypatch.setenv('DEMO_FALLBACK_CACHE', 'false')
+    client = MuseNeuroSymbolicClient()
+    image = 'data:image/png;base64,aW1hZ2U='
+    diagnosis = {
+        'summary_headline': 'Observed failures',
+        'failure_clusters': [{'title': 'Cluster', 'description': 'Evidence', 'cells': [25]}] * 3,
+        'remediation_proof_plan': 'Prove the repair',
+        'diagram_findings': ['Handler exactly-once assumption contradicted by cell 25'],
+    }
+    calls = []
+
+    def request(method, path, **kwargs):
+        body = kwargs['json']
+        calls.append(body)
+        if len(calls) <= len(failures):
+            raise ValueError(f'HTTP {failures[len(calls) - 1]}: image-unit-secret {image}')
+        return {'choices': [{'message': {'content': '```json\n' + json.dumps(diagnosis) + '\n```'}}]}
+
+    monkeypatch.setattr(client, 'api_request', request)
+    result = client.diagnose_multimodal_divergence({}, diagram_image=image)
+    assert client.model_routing['spark_multimodal'] is expected_multimodal
+    assert client.model_routing['spark_live'] is (len(failures) < 3)
+    assert client.model_routing['image_bytes'] == 5
+    assert calls[0]['messages'][1]['content'][1] == {
+        'type': 'image_url', 'image_url': {'url': image}}
+    if failures and failures[0] == 400:
+        assert 'response_format' not in calls[1]
+        assert calls[1]['messages'][1]['content'][1]['image_url']['url'] == image
+    if not expected_multimodal:
+        assert isinstance(calls[-1]['messages'][1]['content'], str)
+    if len(failures) < 3:
+        assert result == diagnosis
+    else:
+        assert 'diagram_findings' not in result
+    recorded = json.dumps(client.model_routing)
+    assert image not in recorded and 'image-unit-secret' not in recorded
+    text_body = json.loads(json.dumps(calls[0]))
+    text_body['messages'][1]['content'] = text_body['messages'][1]['content'][0]['text']
+    assert client.model_routing['payload_chars']['spark'] == [len(json.dumps(text_body))]
+
+
+def test_spark_text_success_and_force_cache_with_image(monkeypatch):
+    from chaoshook_engine.muse_client import MuseNeuroSymbolicClient
+
+    monkeypatch.setenv('MUSE_API_KEY', 'image-unit-secret')
+    monkeypatch.setenv('DEMO_FALLBACK_CACHE', 'true')
+    client = MuseNeuroSymbolicClient()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('force_cache must skip image and text requests')
+
+    monkeypatch.setattr(client, 'api_request', unexpected)
+    cached = client.diagnose_multimodal_divergence({}, diagram_image='data:image/png;base64,aW1hZ2U=')
+    assert client.model_routing['spark_multimodal'] is False
+    assert client.model_routing['spark_live'] is False
+    client.force_cache = False
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append(kwargs['json'])
+        return {'choices': [{'message': {'content': json.dumps(cached)}}]}
+
+    monkeypatch.setattr(client, 'api_request', request)
+    assert client.diagnose_multimodal_divergence({}) == cached
+    assert isinstance(calls[0]['messages'][1]['content'], str)
+    assert client.model_routing['spark_live'] is True
+    assert client.model_routing['spark_multimodal'] is False
+
+
+@pytest.mark.parametrize('image', [
+    'https://example.com/flow.png', 'data:image/svg+xml;base64,PHN2Zz4=',
+    'data:image/png;base64,' + 'A' * 1_500_000,
+    'data:image/jpeg;base64,invalid!',
+])
+def test_diagnose_rejects_invalid_images_before_models(monkeypatch, image):
+    from fastapi.testclient import TestClient
+    from chaoshook_engine import server
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('invalid image must be rejected before any model request')
+
+    monkeypatch.setattr(server.MuseNeuroSymbolicClient, 'api_request', unexpected)
+    response = TestClient(server.app).post('/api/diagnose', json={'diagram_image': image})
+    assert response.status_code == 400
+    assert image not in response.text
+
+
+def test_diagnose_passes_image_to_spark(monkeypatch):
+    from fastapi.testclient import TestClient
+    from chaoshook_engine import server
+
+    image = 'data:image/jpeg;base64,aW1hZ2U='
+    original = server.MuseNeuroSymbolicClient.diagnose_multimodal_divergence
+    seen = []
+
+    def diagnose(self, report, diagram_description=None, diagram_image=None):
+        seen.append(diagram_image)
+        return original(self, report, diagram_description, diagram_image)
+
+    monkeypatch.setattr(server.MuseNeuroSymbolicClient, 'diagnose_multimodal_divergence', diagnose)
+    response = TestClient(server.app).post('/api/diagnose', json={'diagram_image': image, 'use_cache': True})
+    assert response.status_code == 200
+    assert seen == [image]
+    assert response.json()['model_routing']['spark_multimodal'] is False
