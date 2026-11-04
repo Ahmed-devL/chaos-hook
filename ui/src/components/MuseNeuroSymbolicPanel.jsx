@@ -161,7 +161,7 @@ export default function MuseNeuroSymbolicPanel({ analysis, loading, onSelectCell
         <span className="rounded border border-slate-700 px-3 py-2">Meta Muse Spark 1.3</span>
         <span className="rounded border border-slate-700 px-3 py-2">Meta Muse Wonder</span>
         <span className={`rounded border px-3 py-2 ${cached === true ? 'border-brass text-brass' : cached === false ? 'border-emerald text-emerald' : 'border-slate-700 text-slate-400'}`}>
-          {cached === true ? 'VERIFIED CACHE' : cached === false ? 'LIVE MODEL' : 'SOURCE PENDING'}
+          {cached === true ? 'ANALYSIS USES CACHE' : cached === false ? 'LIVE RESPONSES' : 'SOURCE PENDING'}
         </span>
       </header>
       {analysis && <p className="mb-3 inline-block rounded border border-slate-700 px-2 py-1 text-xs text-brass">Spark saw diagram: {analysis.model_routing.spark_live ? analysis.model_routing.spark_multimodal ? 'yes' : 'no (text-only)' : 'cached'}</p>}

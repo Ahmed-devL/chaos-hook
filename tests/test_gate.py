@@ -1440,3 +1440,104 @@ def test_cegis_import_feedback_is_bounded_before_next_request(monkeypatch, repor
     assert len(feedback['import_error']) <= 1000
     assert len(client.model_routing['regression_evidence'][1]['import_error']) <= 300
     assert client.model_routing['candidate_attempts'][-1]['result'] == 'accepted'
+
+
+@pytest.mark.parametrize('mode', ['vulnerable', 'patched'])
+def test_judge_property_evidence_uses_real_validation_results(reports, monkeypatch, mode):
+    from dataclasses import asdict
+    from hashlib import sha256
+    from chaoshook_engine import server
+
+    monkeypatch.setitem(server.app.state._state, 'active_provenance', None)
+    report = reports[mode]
+    evidence = server._verification_evidence({'active_code': 'prepared source'}, report)
+    assert evidence['candidate_sha256'] == sha256(b'prepared source').hexdigest()
+    assert evidence['contract_sha256'] == sha256(json.dumps(asdict(SCENARIO_SPEC), sort_keys=True).encode()).hexdigest()
+    assert evidence['provenance'] == 'prepared'
+    assert evidence['execution_error_cells'] == (1 if mode == 'vulnerable' else 0)
+    assert 'mutation' not in evidence and 'held_out' not in evidence
+    assert len(evidence['business_properties']) == 4
+    for prop in evidence['business_properties']:
+        assert prop['passed'] + prop['failed'] + prop['not_evaluated'] == 27
+        if mode == 'patched':
+            assert prop['not_evaluated'] == 0
+            assert prop['passed'] == 27 and prop['failed'] == 0
+    if mode == 'vulnerable':
+        properties = {p['id']: p for p in evidence['business_properties']}
+        assert properties['credits']['failed'] == 2
+        assert properties['welcome']['failed'] == 1
+        assert properties['lifecycle']['failed'] == 18
+
+
+def test_judge_evidence_never_counts_execution_errors_as_property_passes(reports, monkeypatch):
+    from copy import deepcopy
+    from chaoshook_engine import server
+
+    monkeypatch.setitem(server.app.state._state, 'active_provenance', None)
+    report = deepcopy(reports['patched'])
+    report['cells'][0]['property_violations'] = [{'field': 'execution.errors', 'actual': ['failed after commit']}]
+    report['cells'][0]['passed'] = False
+    report['cells'][1].pop('property_violations')
+    evidence = server._verification_evidence({'active_code': ''}, report)
+    assert evidence['execution_error_cells'] == 1
+    assert all((p['passed'], p['failed'], p['not_evaluated']) == (25, 0, 2)
+               for p in evidence['business_properties'])
+
+
+@pytest.mark.parametrize('source_kind', ['live_model_response', 'cached_fallback'])
+def test_judge_api_ties_installed_provenance_to_actual_candidate_hash(source_editor, monkeypatch, source_kind):
+    from hashlib import sha256
+    from chaoshook_engine import server
+
+    client, active = source_editor
+    source = Path(v2_patched.__file__).read_text(encoding='utf-8')
+    client.post('/api/reset')
+
+    def request(self, *args, **kwargs):
+        if kwargs['json']['model'] != self.wonder_model:
+            raise ValueError('mock Spark cache')
+        return {'choices': [{'message': {'content': json.dumps({
+            'invariants': self._invariants({}), 'patched_code': source,
+        })}}]}
+
+    monkeypatch.setenv('MUSE_API_KEY', 'unit-secret')
+    monkeypatch.setenv('DEMO_FALLBACK_CACHE', 'false')
+    monkeypatch.setattr(server.MuseNeuroSymbolicClient, 'api_request', request)
+    analysis = client.post('/api/diagnose', json={'use_cache': source_kind == 'cached_fallback'}).json()
+    audit = analysis['model_routing']
+    assert len(audit['candidate_attempts']) == 1
+    assert audit['selected_candidate']['provenance'] == source_kind
+    before = client.get('/api/status').json()['verification_evidence']
+    assert before['provenance'] == 'prepared'  # Proposed repair is not active yet.
+    response = client.post('/api/patch', json={'patched_code': analysis['patched_code']})
+    assert response.status_code == 200
+    installed = response.json()['verification_evidence']
+    assert installed['candidate_sha256'] == sha256(active.read_bytes()).hexdigest()
+    assert installed['candidate_sha256'] == audit['selected_candidate']['candidate_sha256']
+    assert installed['provenance'] == source_kind
+    assert client.get('/api/status').json()['verification_evidence'] == installed
+    # A subsequent manual edit is prepared source, even if text matches a prior repair.
+    edited = client.post('/api/update-source', json={'source_code': source + '\n'}).json()
+    assert edited['verification_evidence']['provenance'] == 'prepared'
+    assert client.post('/api/reset').json()['verification_evidence']['provenance'] == 'prepared'
+
+
+def test_judge_evidence_ignores_stale_source_provenance(monkeypatch, reports):
+    from chaoshook_engine import server
+
+    monkeypatch.setitem(server.app.state._state, 'active_provenance', {
+        'candidate_sha256': 'a different source', 'provenance': 'live_model_response'})
+    evidence = server._verification_evidence({'active_code': 'external edit'}, reports['patched'])
+    assert evidence['provenance'] == 'prepared'
+
+
+def test_judge_evidence_reports_entity_corruption_from_real_seeded_run(mutation_results, monkeypatch):
+    from chaoshook_engine import server
+
+    monkeypatch.setitem(server.app.state._state, 'active_provenance', None)
+    result = next(item for item in mutation_results
+                  if item['candidate'] == 'wrong_user_attribution' and item['seed'] == 101)
+    evidence = server._verification_evidence({'active_code': 'test fixture'}, result['report'])
+    properties = {item['id']: item for item in evidence['business_properties']}
+    assert properties['credits']['failed'] == properties['entities']['failed'] == 27
+    assert evidence['execution_error_cells'] == 0
